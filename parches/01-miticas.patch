@@ -1,0 +1,3288 @@
+diff --git a/src/server/game/Handlers/ChallengeModeHandler.cpp b/src/server/game/Handlers/ChallengeModeHandler.cpp
+new file mode 100644
+index 0000000000..1f01b06f84
+--- /dev/null
++++ b/src/server/game/Handlers/ChallengeModeHandler.cpp
+@@ -0,0 +1,100 @@
++/*
++ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * El arranque de la mitica+: el cliente manda CMSG_START_CHALLENGE_MODE cuando el lider inserta
++ * la piedra en el receptaculo. La fuente de verdad es EL INVENTARIO: el cliente dice donde esta la
++ * piedra y aca se mira el item real (no la tabla characters.mitica_piedra, que solo recuerda que
++ * modificadores lleva el item). Si el item no esta, no hay corrida.
++ */
++
++#include "ChallengeModePackets.h"
++#include "DatabaseEnv.h"
++#include "Item.h"
++#include "Log.h"
++#include "MythicPlusMgr.h"
++#include "Player.h"
++#include "StringFormat.h"
++#include "WorldSession.h"
++
++void WorldSession::HandleStartChallengeMode(WorldPackets::ChallengeMode::StartChallengeMode& packet)
++{
++    Player* jugador = GetPlayer();
++    if (!jugador || !jugador->IsInWorld())
++        return;
++
++    std::string crudo;
++    for (uint8 byte : packet.Crudo)
++        crudo += Trinity::StringFormat("{:02X} ", byte);
++    TC_LOG_INFO("scripts.miticas", "CMSG_START_CHALLENGE_MODE de {} ({} bytes): {} | bolsa {} ranura {}",
++        jugador->GetName(), uint32(packet.Crudo.size()), crudo, packet.Bolsa, packet.Ranura);
++
++    // La piedra que el cliente señala, verificada contra el inventario real.
++    Item* piedra = jugador->GetItemByPos(packet.Bolsa, packet.Ranura);
++    if (!piedra || piedra->GetEntry() != sMythicPlus->ItemPiedra())
++        piedra = sMythicPlus->PiedraEnInventario(jugador);   // sin posicion util: la que haya
++
++    if (!piedra)
++    {
++        SendNotification("%s", "No tenes una piedra angular mitica en el inventario.");
++        return;
++    }
++
++    QueryResult fila = CharacterDatabase.PQuery(
++        "SELECT cm_id, nivel FROM mitica_piedra WHERE item_guid = {}", piedra->GetGUID().GetCounter());
++    if (!fila)
++    {
++        SendNotification("%s", "El servidor no sabe de que mazmorra es esa piedra: pedila con .mitica piedra.");
++        return;
++    }
++
++    Field* campos = fila->Fetch();
++    uint32 cmId = campos[0].GetUInt32();
++    uint32 nivel = campos[1].GetUInt32();
++
++    std::string motivo;
++    bool prueba = jugador->IsGameMaster();   // las corridas de GM no ensucian el historial
++    if (!sMythicPlus->Iniciar(jugador, piedra, cmId, nivel, prueba, motivo))
++        SendNotification("No se pudo arrancar la mitica+: %s", motivo.c_str());
++}
++
++/*
++ * El panel de temporada de miticas+. El cliente pide los datos con un paquete VACIO y el oficial
++ * contesta SMSG_MYTHIC_PLUS_SEASON_DATA de UN byte (`IsMythicPlusActive: True`) - medido dos veces en
++ * la captura del oficial: 19-sep y 21-sep (pedido 11:46:20.637, respuesta 11:46:21.688).
++ *
++ * El formato NO se escribe aca: sale de la base (`mitica_paquete` + `mitica_paquete_campo`), el mismo
++ * paquete que ya se manda al arrancar una corrida. Asi se corrige sin recompilar.
++ */
++void WorldSession::HandleRequestMythicPlusSeasonData(WorldPackets::ChallengeMode::RequestMythicPlusSeasonData& /*packet*/)
++{
++    Player* jugador = GetPlayer();
++    if (!jugador)
++        return;
++
++    if (Trinity::MythicPlus::Corrida* corrida = sMythicPlus->GetCorridaDe(jugador))
++    {
++        sMythicPlus->EnviarPaquete(jugador, *corrida, "SMSG_MYTHIC_PLUS_SEASON_DATA");
++        return;
++    }
++
++    // Sin corrida en curso el panel se abre igual (temporada, afijos y puntaje): el paquete es un dato
++    // constante declarado en la base y no depende de la corrida. Se manda con una corrida vacia para
++    // que el camino sea el mismo que en una corrida real.
++    Trinity::MythicPlus::Corrida sinCorrida;
++    sMythicPlus->EnviarPaquete(jugador, sinCorrida, "SMSG_MYTHIC_PLUS_SEASON_DATA");
++}
+diff --git a/src/server/game/MythicPlus/EscaladoEstanciaMgr.cpp b/src/server/game/MythicPlus/EscaladoEstanciaMgr.cpp
+new file mode 100644
+index 0000000000..d3bc9e6e2c
+--- /dev/null
++++ b/src/server/game/MythicPlus/EscaladoEstanciaMgr.cpp
+@@ -0,0 +1,188 @@
++#include "EscaladoEstanciaMgr.h"
++
++#include "Creature.h"
++#include "DatabaseEnv.h"
++#include "Log.h"
++#include "Map.h"
++#include "Player.h"
++#include "StringFormat.h"
++
++namespace Trinity
++{
++namespace Instancias
++{
++namespace
++{
++constexpr uint16 CUALQUIER_DIFICULTAD = 0xFFFF;
++
++uint64 Clave(uint32 mapa, uint16 dificultad)
++{
++    return (uint64(mapa) << 16) | dificultad;
++}
++
++ModoEscalado ModoDesdeTexto(std::string const& texto)
++{
++    if (texto == "rango")
++        return ModoEscalado::Rango;
++    if (texto == "grupo")
++        return ModoEscalado::Grupo;
++    return ModoEscalado::Cliente;
++}
++
++char const* TextoDe(ModoEscalado modo)
++{
++    switch (modo)
++    {
++        case ModoEscalado::Rango: return "rango";
++        case ModoEscalado::Grupo: return "grupo";
++        default:                  return "cliente";
++    }
++}
++} // namespace
++
++EscaladoMgr* EscaladoMgr::instance()
++{
++    static EscaladoMgr instancia;
++    return &instancia;
++}
++
++void EscaladoMgr::Cargar()
++{
++    _reglas.clear();
++    _porMapaYDificultad.clear();
++    _avisados.clear();
++
++    if (QueryResult resultado = WorldDatabase.Query(
++            "SELECT map, difficulty, modo, nivel_min, nivel_max, nota FROM instancia_escalado "
++            "ORDER BY map, difficulty"))
++    {
++        do
++        {
++            Field* campos = resultado->Fetch();
++
++            ReglaEscalado regla;
++            regla.MapId = campos[0].GetUInt32();
++            regla.Difficulty = campos[1].GetUInt16();
++            regla.Modo = ModoDesdeTexto(campos[2].GetString());
++            regla.NivelMin = uint8(campos[3].GetUInt32());
++            regla.NivelMax = uint8(campos[4].GetUInt32());
++            regla.Nota = campos[5].GetString();
++
++            _porMapaYDificultad[Clave(regla.MapId, regla.Difficulty)] = _reglas.size();
++            _reglas.push_back(regla);
++        } while (resultado->NextRow());
++    }
++
++    // El logger es `scripts.miticas` a proposito: los loggers propios solo llegan a Server.log si
++    // tienen su linea en worldserver.conf (Logger.scripts.miticas=3) y `Logger.root=5` filtra los INFO,
++    // asi que un `scripts.escalado` nuevo caeria en el olvido sin avisar. Este ya esta configurado.
++    uint32 porModo[3] = { 0, 0, 0 };
++    for (ReglaEscalado const& regla : _reglas)
++        ++porModo[uint8(regla.Modo)];
++
++    TC_LOG_INFO("scripts.miticas",
++        "escalado por estancia cargado: {} regla(s) (cliente {}, rango {}, grupo {})",
++        _reglas.size(), porModo[0], porModo[1], porModo[2]);
++}
++
++std::vector<std::string> EscaladoMgr::DescribirReglas() const
++{
++    std::vector<std::string> lineas;
++    for (ReglaEscalado const& regla : _reglas)
++    {
++        // Las de modo 'cliente' no se listan: son la mayoria y no cambian nada.
++        if (regla.Modo == ModoEscalado::Cliente)
++            continue;
++
++        std::string banda = regla.Modo == ModoEscalado::Rango
++            ? StringFormat(" banda {}-{}", regla.NivelMin, regla.NivelMax)
++            : std::string();
++
++        lineas.push_back(StringFormat("mapa {} dificultad {} modo '{}'{}{}{}",
++            regla.MapId, regla.Difficulty, TextoDe(regla.Modo), banda,
++            regla.Nota.empty() ? "" : " :: ", regla.Nota));
++    }
++    return lineas;
++}
++
++ReglaEscalado const* EscaladoMgr::Buscar(uint32 mapId, uint16 difficulty) const
++{
++    // La regla exacta manda; si no hay, vale la de "cualquier dificultad" del mismo mapa.
++    if (auto it = _porMapaYDificultad.find(Clave(mapId, difficulty)); it != _porMapaYDificultad.end())
++        return &_reglas[it->second];
++
++    if (auto it = _porMapaYDificultad.find(Clave(mapId, CUALQUIER_DIFICULTAD));
++        it != _porMapaYDificultad.end())
++        return &_reglas[it->second];
++
++    return nullptr;
++}
++
++void EscaladoMgr::AplicarAlSpawn(Creature* criatura) const
++{
++    if (!criatura)
++        return;
++
++    Map* mapa = criatura->GetMap();
++    if (!mapa)
++        return;
++
++    uint16 dificultad = uint16(mapa->GetDifficultyID());
++    ReglaEscalado const* regla = Buscar(mapa->GetId(), dificultad);
++    if (!regla || regla->Modo == ModoEscalado::Cliente)
++        return;
++
++    switch (regla->Modo)
++    {
++        case ModoEscalado::Rango:
++        {
++            // Sin banda declarada no se adivina: una regla a medio llenar es un error de dato, no una
++            // excusa para inventar un nivel.
++            if (!regla->NivelMin || !regla->NivelMax || regla->NivelMin > regla->NivelMax)
++            {
++                TC_LOG_ERROR("scripts.miticas",
++                    "regla de rango invalida en el mapa {} dificultad {}: min {} max {} (se ignora)",
++                    regla->MapId, regla->Difficulty, regla->NivelMin, regla->NivelMax);
++                return;
++            }
++
++            // El delta no se toca: sigue siendo el del dato de la criatura (jefes +2, chusma 0).
++            criatura->SetScalingLevelRange(regla->NivelMin, regla->NivelMax);
++            break;
++        }
++        case ModoEscalado::Grupo:
++        {
++            uint8 nivelGrupo = 0;
++            for (auto const& referencia : mapa->GetPlayers())
++                if (Player* jugador = referencia.GetSource())
++                    if (jugador->GetLevel() > nivelGrupo)
++                        nivelGrupo = jugador->GetLevel();
++
++            if (!nivelGrupo)
++                return; // nadie adentro todavia: no hay nivel al que subir
++
++            if (criatura->HasScalableLevels())
++            {
++                // SelectLevel() tomara ScalingLevelMax + delta, asi que con este delta queda en el
++                // nivel del grupo sin tocar el nivel a mano.
++                criatura->SetScaledDisplayLevel(nivelGrupo);
++            }
++            else
++            {
++                // Criatura sin escalado del cliente (contenido viejo): se sube como en la corrida.
++                criatura->SetLevel(nivelGrupo);
++                criatura->UpdateLevelDependantStats();
++            }
++            break;
++        }
++        default:
++            return;
++    }
++
++    if (_avisados.insert(Clave(mapa->GetId(), dificultad)).second)
++        TC_LOG_INFO("scripts.miticas",
++            "escalado aplicado: mapa {} dificultad {} modo '{}' (regla: {})",
++            mapa->GetId(), dificultad, TextoDe(regla->Modo), regla->Nota);
++}
++} // namespace Instancias
++} // namespace Trinity
+diff --git a/src/server/game/MythicPlus/EscaladoEstanciaMgr.h b/src/server/game/MythicPlus/EscaladoEstanciaMgr.h
+new file mode 100644
+index 0000000000..f3e1e9e105
+--- /dev/null
++++ b/src/server/game/MythicPlus/EscaladoEstanciaMgr.h
+@@ -0,0 +1,91 @@
++/*
++ * Escalado por estancia (Fase 2 del diseno: docs/sistemas/miticas/DISENO-DUNGEONS-ESCALABLES.md).
++ *
++ * VIVE EN MythicPlus/ POR UNA RAZON DE BUILD, no de tema: el CMake del core recolecta las fuentes con
++ * GLOB en el momento del configure (cmake/macros/AutoCollect.cmake, sin CONFIGURE_DEPENDS), asi que una
++ * carpeta nueva -y su cabecera en la ruta de include- no entra al build sin volver a configurar. Si el
++ * sistema crece, se muda a su propia carpeta y se re-configura el build de una vez.
++ *
++ * QUE HACE
++ *   Cuando una criatura entra al mundo (Creature::SelectLevel -> Creature::ApplyLevelScaling), mira si
++ *   su mapa y su dificultad tienen una regla en `world.instancia_escalado` y, si la tienen, ajusta los
++ *   campos de escalado que el cliente usa para ROTULAR (clamp(nivelDelJugador, ScalingLevelMin,
++ *   ScalingLevelMax) + ScalingLevelDelta) y que el core usa para la vida, el dano y la armadura.
++ *
++ *   El enganche es ese y no el arranque de la corrida a proposito: asi tambien quedan escaladas las
++ *   criaturas que APARECEN DESPUES del arranque (oleadas, invocadas, jefes que se suman a mitad), que
++ *   era el limite conocido de la Fase 1.
++ *
++ * MODOS (la perilla es DATO: se cambia con un UPDATE, no recompilando)
++ *   cliente : no se toca nada. Es el defecto y es el comportamiento medido del oficial: el rango sale
++ *             del ContentTuning del mapa/dificultad y el delta del dato de la criatura.
++ *             Medido en vivo el 21-sep-2026 en los calabozos de cronoviaje: jefes +2, notables +1,
++ *             chusma 0, ayudantes de mecanica en negativo.
++ *   rango   : la estancia juega en una banda declarada [nivel_min, nivel_max]. Es el "en la mazmorra
++ *             normal, un nivel 50" del pedido, y tambien el "heroica/mitica al tope de la expansion"
++ *             (declarando la banda, ej. 85-90).
++ *   grupo   : el contenido sube al nivel del miembro mas alto del grupo presente. Es lo que ya hacia
++ *             la corrida de miticas+ al arrancar.
++ *
++ * SI NO HAY FILA, NO PASA NADA: sin regla declarada el sistema es transparente y manda el cliente.
++ */
++#ifndef TRINITY_ESCALADO_ESTANCIA_MGR_H
++#define TRINITY_ESCALADO_ESTANCIA_MGR_H
++
++#include "Define.h"
++#include <cstdint>
++#include <map>
++#include <set>
++#include <string>
++#include <vector>
++
++class Creature;
++
++namespace Trinity
++{
++namespace Instancias
++{
++enum class ModoEscalado : uint8
++{
++    Cliente = 0,
++    Rango,
++    Grupo
++};
++
++// Una regla de `world.instancia_escalado`. Difficulty 65535 = cualquier dificultad del mapa.
++struct ReglaEscalado
++{
++    uint32 MapId = 0;
++    uint16 Difficulty = 0;
++    ModoEscalado Modo = ModoEscalado::Cliente;
++    uint8 NivelMin = 0;
++    uint8 NivelMax = 0;
++    std::string Nota;
++};
++
++class EscaladoMgr
++{
++public:
++    static EscaladoMgr* instance();
++
++    void Cargar();                                    // lee world.instancia_escalado
++    void AplicarAlSpawn(Creature* criatura) const;    // enganche: al escalar la criatura recien creada
++    uint32 GetReglas() const { return uint32(_reglas.size()); }
++
++    // Lineas legibles para el comando de consola: las reglas que HACEN algo (las de modo 'cliente' no
++    // se listan una por una: son la mayoria y no cambian nada).
++    std::vector<std::string> DescribirReglas() const;
++
++private:
++    ReglaEscalado const* Buscar(uint32 mapId, uint16 difficulty) const;
++
++    std::vector<ReglaEscalado> _reglas;
++    std::map<uint64, size_t> _porMapaYDificultad;
++    mutable std::set<uint64> _avisados;               // una linea de log por (mapa, dificultad)
++};
++} // namespace Instancias
++} // namespace Trinity
++
++#define sEscaladoInstancia Trinity::Instancias::EscaladoMgr::instance()
++
++#endif
+diff --git a/src/server/game/MythicPlus/MythicPlusMgr.cpp b/src/server/game/MythicPlus/MythicPlusMgr.cpp
+new file mode 100644
+index 0000000000..6ddca8e367
+--- /dev/null
++++ b/src/server/game/MythicPlus/MythicPlusMgr.cpp
+@@ -0,0 +1,1861 @@
++/*
++ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include "MythicPlusMgr.h"
++#include "Creature.h"
++#include "DatabaseEnv.h"
++#include "DBCEnums.h"
++#include "GameObject.h"
++#include "Group.h"
++#include "Item.h"
++#include "ItemBonusMgr.h"
++#include "ItemDefines.h"
++#include "Log.h"
++#include "Mail.h"
++#include "Map.h"
++#include "MapManager.h"
++#include "ObjectAccessor.h"
++#include "Opcodes.h"
++#include "PathGenerator.h"
++#include "Player.h"
++#include "StringFormat.h"
++#include "Util.h"
++#include "WorldPacket.h"
++#include "WorldSession.h"
++
++#include <charconv>
++#include <cmath>
++#include <cstdlib>
++#include <tuple>
++#include <vector>
++
++namespace Trinity
++{
++namespace MythicPlus
++{
++namespace
++{
++// Nombre (base) -> opcode del servidor. Solo los que usamos.
++bool OpcodeDeNombre(std::string const& nombre, OpcodeServer& salida)
++{
++    if (nombre == "SMSG_CHALLENGE_MODE_START")              { salida = SMSG_CHALLENGE_MODE_START; return true; }
++    if (nombre == "SMSG_CHALLENGE_MODE_UPDATE_DEATH_COUNT") { salida = SMSG_CHALLENGE_MODE_UPDATE_DEATH_COUNT; return true; }
++    if (nombre == "SMSG_CHALLENGE_MODE_COMPLETE")           { salida = SMSG_CHALLENGE_MODE_COMPLETE; return true; }
++    // Temporada y afijos: son los que le dicen al cliente que la mitica+ esta ACTIVA. Sin ellos el
++    // cliente puede ocultar toda la UI de miticas+, por mas que el resto de los paquetes llegue.
++    if (nombre == "SMSG_MYTHIC_PLUS_SEASON_DATA")           { salida = SMSG_MYTHIC_PLUS_SEASON_DATA; return true; }
++    if (nombre == "SMSG_MYTHIC_PLUS_CURRENT_AFFIXES")       { salida = SMSG_MYTHIC_PLUS_CURRENT_AFFIXES; return true; }
++    return false;
++}
++
++std::string AHex(std::vector<uint8> const& bytes)
++{
++    std::string salida;
++    for (uint8 b : bytes)
++        salida += Trinity::StringFormat("{:02X} ", b);
++    return salida;
++}
++
++std::vector<uint32> ListaDeIds(std::string const& texto)
++{
++    // Los ids pueden venir separados por espacios (lo que dice la documentacion de la tabla) o por
++    // comas, que es como los escribe uno naturalmente. Se aceptan los dos: si esto no fuera tolerante,
++    // una coma de mas deja la lista VACIA y la regla que la usa simplemente no hace nada, sin error.
++    std::string limpio = texto;
++    for (char& caracter : limpio)
++    {
++        if (caracter == ',' || caracter == ';')
++            caracter = ' ';
++    }
++
++    std::vector<uint32> ids;
++    for (std::string_view parte : Trinity::Tokenize(limpio, ' ', false))
++    {
++        uint32 valor = 0;
++        auto [fin, error] = std::from_chars(parte.data(), parte.data() + parte.size(), valor);
++        if (error == std::errc() && fin == parte.data() + parte.size() && valor)
++            ids.push_back(valor);
++    }
++    return ids;
++}
++} // namespace
++
++// El HUD de la mitica+ NO vive en el paquete: el temporizador sale del campo de update del jugador
++// (`ActivePlayerData.ChallengeModeData`, bit 134, con `StartTime`). Nuestro codigo nunca lo escribia,
++// asi que el cliente veia StartTime = 0: el reloj no corria y el panel de cierre mostraba "se acabo el
++// tiempo" aunque la medalla fuera buena. Las dos puertas viven en `Player` (los setters de update
++// fields son protected en BaseEntity): `MarcarDesafioMythicPlus` / `QuitarDesafioMythicPlus`.
++void MarcarDesafio(Player* jugador, Corrida const& corrida, bool activo)
++{
++    if (!jugador)
++        return;
++
++    if (!activo)
++    {
++        jugador->QuitarDesafioMythicPlus();
++        return;
++    }
++
++    jugador->MarcarDesafioMythicPlus(int32(corrida.MapId), int32(corrida.Miembros.size()),
++        uint64(corrida.Instancia), int64(corrida.Inicio), corrida.Lider, corrida.Prueba);
++}
++
++Mgr* Mgr::instance()
++{
++    static Mgr instancia;
++    return &instancia;
++}
++
++// ---------------------------------------------------------------------------
++// Configuracion: todo sale de world.mitica_*
++// ---------------------------------------------------------------------------
++void Mgr::CargarConfig()
++{
++    _estancias.clear();
++    _porCmId.clear();
++    _niveles.clear();
++    _afijos.clear();
++    _config.clear();
++    _temporadaNombre = "Temporada";
++
++    // 1) la temporada viva: es la que decide QUE estancias entran
++    uint32 temporadaActiva = 0;
++    if (QueryResult temporada = WorldDatabase.Query(
++            "SELECT id, nombre FROM mitica_temporada WHERE activa = 1 ORDER BY desde DESC LIMIT 1"))
++    {
++        Field* campos = temporada->Fetch();
++        temporadaActiva = campos[0].GetUInt32();
++        _temporadaNombre = campos[1].GetString();
++    }
++
++    // 2) los numeros y los textos (nada quemado en el codigo)
++    if (QueryResult config = WorldDatabase.Query("SELECT clave, valor FROM mitica_config"))
++        do
++        {
++            Field* campos = config->Fetch();
++            _config[campos[0].GetString()] = campos[1].GetString();
++        } while (config->NextRow());
++
++    // Los afijos y su EFECTO. `Implementacion` decide como se aplica; hoy el motor entiende `estatico`
++    // (multiplicador de vida/dano, leido de `Parametros`). El resto queda declarado y sin efecto, que es
++    // informacion honesta: en `mitica_afijo` se ve de un vistazo que falta y cual.
++    if (QueryResult afijos = WorldDatabase.Query(
++            "SELECT afijo_id, nombre, implementacion, parametros, activo FROM mitica_afijo"))
++    {
++        do
++        {
++            Field* campos = afijos->Fetch();
++            Afijo a;
++            a.Id = campos[0].GetUInt32();
++            a.Nombre = campos[1].GetString();
++            a.Implementacion = campos[2].GetString();
++            a.Parametros = campos[3].GetString();
++            a.Activo = campos[4].GetUInt32() != 0;
++            _afijos[a.Id] = a;
++        } while (afijos->NextRow());
++
++        uint32 conEfecto = 0;
++        for (auto const& [id, afijo] : _afijos)
++            if (afijo.Activo && afijo.Implementacion != "sin_implementar")
++                ++conEfecto;
++
++        TC_LOG_INFO("scripts.miticas", "afijos cargados: {} declarados, {} activos con efecto", _afijos.size(), conEfecto);
++    }
++
++    // 3) las estancias de esa temporada (sin temporada declarada entran todas)
++    std::string filtro = temporadaActiva
++        ? Trinity::StringFormat("WHERE temporada = {}", temporadaActiva)
++        : std::string();
++
++    if (QueryResult resultado = WorldDatabase.Query(
++            Trinity::StringFormat(
++                "SELECT cm_id, map_id, nombre, temporada, activa, nivel_min, nivel_rec, nivel_max, "
++                "tiempo_oro, tiempo_plata, tiempo_bronce, fuerzas_min, cofre_go, ilvl_techo, jefe_final, "
++                "camino_jefes, camino_go, camino_quitar, salida_npc, salida_punto "
++                "FROM mitica_estancia {} ORDER BY cm_id", filtro).c_str()))
++    {
++        do
++        {
++            Field* campos = resultado->Fetch();
++            Estancia e;
++            e.CmId = campos[0].GetUInt32();
++            e.MapId = campos[1].GetUInt32();
++            e.Nombre = campos[2].GetString();
++            e.Temporada = campos[3].GetUInt32();
++            e.Activa = campos[4].GetUInt8() != 0;
++            e.NivelMin = campos[5].GetUInt32();
++            e.NivelRec = campos[6].GetUInt32();
++            e.NivelMax = campos[7].GetUInt32();
++            e.TiempoOro = campos[8].GetUInt32();
++            e.TiempoPlata = campos[9].GetUInt32();
++            e.TiempoBronce = campos[10].GetUInt32();
++            e.FuerzasMin = campos[11].GetUInt32();
++            e.CofreGo = campos[12].GetUInt32();
++            e.IlvlTecho = campos[13].GetUInt32();
++            e.JefeFinal = campos[14].GetString();
++            e.CaminoJefes = campos[15].GetString();
++            e.CaminoGo = campos[16].GetUInt32();
++            e.CaminoQuitar = campos[17].GetString();
++            e.SalidaNpc = campos[18].GetUInt32();
++            e.SalidaPunto = campos[19].GetString();
++            _porCmId[e.CmId] = e;
++            _estancias.push_back(e);
++        } while (resultado->NextRow());
++    }
++
++    // Botin del cofre por estancia (dato plano: cm_id -> item). El cofre lo entrega NUESTRO codigo,
++    // porque el core no tiene logica para el tipo 51 (GAMEOBJECT_TYPE_CHALLENGE_MODE_REWARD).
++    if (QueryResult resultado = WorldDatabase.Query("SELECT cm_id, item FROM mitica_cofre_item ORDER BY cm_id, item"))
++    {
++        uint32 total = 0;
++        do
++        {
++            Field* campos = resultado->Fetch();
++            uint32 cmId = campos[0].GetUInt32();
++            uint32 item = campos[1].GetUInt32();
++            if (!item)
++                continue;
++
++            for (Estancia& estancia : _estancias)
++                if (estancia.CmId == cmId)
++                {
++                    estancia.CofreItems.push_back(item);
++                    ++total;
++                    break;
++                }
++
++            auto itr = _porCmId.find(cmId);
++            if (itr != _porCmId.end())
++                itr->second.CofreItems.push_back(item);
++        } while (resultado->NextRow());
++
++        TC_LOG_INFO("scripts.miticas", "botin de cofres cargado: {} item(s) en {} estancia(s)", total, _estancias.size());
++    }
++
++    if (QueryResult resultado = WorldDatabase.Query(
++            "SELECT nivel, vida_pct, dano_pct, jefe_vida_pct, jefe_dano_pct, fuerzas_objetivo, "
++            "ilvl_min, ilvl_max FROM mitica_nivel"))
++    {
++        do
++        {
++            Field* campos = resultado->Fetch();
++            Nivel n;
++            n.NivelPiedra = campos[0].GetUInt32();
++            n.VidaPct = campos[1].GetFloat();
++            n.DanoPct = campos[2].GetFloat();
++            n.JefeVidaPct = campos[3].GetFloat();
++            n.JefeDanoPct = campos[4].GetFloat();
++            n.FuerzasObjetivo = campos[5].GetUInt32();
++            n.IlvlMin = campos[6].GetUInt32();
++            n.IlvlMax = campos[7].GetUInt32();
++            _niveles[n.NivelPiedra] = n;
++        } while (resultado->NextRow());
++    }
++
++    _configCargada = true;
++    TC_LOG_INFO("scripts.miticas", "config de miticas cargada: temporada '{}' con {} estancias, "
++        "{} niveles y {} claves de config", _temporadaNombre, uint32(_estancias.size()),
++        uint32(_niveles.size()), uint32(_config.size()));
++}
++
++Estancia const* Mgr::GetEstancia(uint32 cmId) const
++{
++    auto itr = _porCmId.find(cmId);
++    return itr == _porCmId.end() ? nullptr : &itr->second;
++}
++
++Nivel const* Mgr::GetNivel(uint32 nivelKeystone) const
++{
++    auto itr = _niveles.find(nivelKeystone);
++    return itr == _niveles.end() ? nullptr : &itr->second;
++}
++
++// ---------------------------------------------------------------------------
++// Configuracion dinamica (world.mitica_config): numeros y textos sin recompilar
++// ---------------------------------------------------------------------------
++std::string Mgr::Config(std::string const& clave, std::string const& porDefecto) const
++{
++    auto itr = _config.find(clave);
++    return itr == _config.end() ? porDefecto : itr->second;
++}
++
++uint32 Mgr::ConfigNumero(std::string const& clave, uint32 porDefecto) const
++{
++    auto itr = _config.find(clave);
++    return itr == _config.end() ? porDefecto : uint32(strtoul(itr->second.c_str(), nullptr, 10));
++}
++
++uint32 Mgr::ItemPiedra() const           { return ConfigNumero("piedra_item", 180653); }
++uint32 Mgr::AfijosMax() const            { return ConfigNumero("afijos_max", 4); }
++std::string Mgr::TemporadaNombre() const { return _temporadaNombre; }
++
++std::string Mgr::Plantilla(std::string const& clave, Corrida const& corrida,
++    std::initializer_list<std::pair<std::string, std::string>> extras) const
++{
++    std::string texto = Config(clave, clave);   // si falta la clave, se ve el nombre de la clave
++
++    Estancia const* estancia = GetEstancia(corrida.CmId);
++    auto reemplazar = [&texto](std::string const& claveValor, std::string const& valor)
++    {
++        std::string marca = "{" + claveValor + "}";
++        for (std::size_t pos = texto.find(marca); pos != std::string::npos; pos = texto.find(marca, pos))
++            texto.replace(pos, marca.size(), valor);
++    };
++
++    reemplazar("estancia", estancia ? estancia->Nombre : "?");
++    reemplazar("temporada", _temporadaNombre);
++    reemplazar("nivel", Trinity::StringFormat("{}", corrida.NivelKeystone));
++    reemplazar("oro", Trinity::StringFormat("{}", estancia ? estancia->TiempoOro / 60 : 0));
++    reemplazar("plata", Trinity::StringFormat("{}", estancia ? estancia->TiempoPlata / 60 : 0));
++    reemplazar("bronce", Trinity::StringFormat("{}", estancia ? estancia->TiempoBronce / 60 : 0));
++    reemplazar("muertes", Trinity::StringFormat("{}", corrida.Muertes));
++    reemplazar("fuerzas", Trinity::StringFormat("{:.0f}", corrida.Fuerzas));
++    reemplazar("tiempo", Trinity::StringFormat("{} min {} s",
++        corrida.SegundosTranscurridos() / 60, corrida.SegundosTranscurridos() % 60));
++    reemplazar("medalla", Medalla(corrida));
++
++    for (auto const& [claveExtra, valorExtra] : extras)
++        reemplazar(claveExtra, valorExtra);
++
++    return texto;
++}
++
++// ---------------------------------------------------------------------------
++// Ciclo de vida
++// ---------------------------------------------------------------------------
++bool Mgr::Iniciar(Player* lider, Item* piedra, uint32 cmId, uint32 nivelKeystone, bool prueba,
++    std::string& motivo)
++{
++    if (!_configCargada)
++        CargarConfig();
++
++    Estancia const* estancia = GetEstancia(cmId);
++    if (!estancia)
++    {
++        motivo = "esa estancia no esta en la temporada";
++        return false;
++    }
++    if (!estancia->Activa)
++    {
++        motivo = Trinity::StringFormat("{} esta apagada en la temporada", estancia->Nombre);
++        return false;
++    }
++    if (nivelKeystone < estancia->NivelMin || nivelKeystone > estancia->NivelMax)
++    {
++        motivo = Trinity::StringFormat("{} pide nivel de piedra entre {} y {} (la tuya es {})",
++            estancia->Nombre, estancia->NivelMin, estancia->NivelMax, nivelKeystone);
++        return false;
++    }
++
++    Map* mapa = lider->GetMap();
++    if (!mapa || !mapa->IsDungeon())
++    {
++        motivo = "hay que estar dentro de la mazmorra";
++        return false;
++    }
++    if (mapa->GetId() != estancia->MapId)
++    {
++        motivo = Trinity::StringFormat("estas en otra mazmorra (mapa {}), no en {}",
++            mapa->GetId(), estancia->Nombre);
++        return false;
++    }
++    if (Corrida* existente = GetCorridaPorInstancia(mapa->GetId(), mapa->GetInstanceId()))
++    {
++        motivo = Trinity::StringFormat("ya hay una corrida en curso aca (id {})", existente->Id);
++        return false;
++    }
++
++    // La piedra tiene que estar de verdad en el inventario del lider: el ITEM manda, no la tabla
++    // (la tabla solo recuerda que modificadores lleva). Si no esta, la corrida no arranca.
++    if (!piedra || piedra->GetEntry() != ItemPiedra() || !lider->GetItemByGuid(piedra->GetGUID()))
++    {
++        motivo = "la piedra no esta en tu inventario";
++        return false;
++    }
++
++    uint64 nuevoId = 1;
++    if (QueryResult maximo = CharacterDatabase.Query("SELECT COALESCE(MAX(corrida_id), 0) + 1 FROM mitica_corrida"))
++        if (Field* campo = maximo->Fetch())
++            nuevoId = campo[0].GetUInt64();
++
++    // Afijos que entran a este nivel: el calendario del cliente (mitica_afijo_nivel) filtrado por los
++    // que tenemos activos en mitica_afijo. Se materializa antes de tocar otras consultas.
++    std::string afijos;
++    {
++        std::vector<uint32> ids;
++        if (QueryResult res = WorldDatabase.PQuery(
++                "SELECT an.afijo_id FROM mitica_afijo_nivel an JOIN mitica_afijo a ON a.afijo_id = an.afijo_id "
++                "WHERE an.desde_nivel <= {} AND an.desde_nivel > 0 AND a.activo = 1 ORDER BY an.afijo_id",
++                nivelKeystone))
++            do
++            {
++                ids.push_back(res->Fetch()[0].GetUInt32());
++            } while (res->NextRow());
++
++        for (uint32 id : ids)
++            afijos += Trinity::StringFormat("{} ", id);
++    }
++
++    Corrida corrida;
++    corrida.Id = nuevoId;
++    corrida.CmId = cmId;
++    corrida.MapId = estancia->MapId;
++    corrida.NivelKeystone = nivelKeystone;
++    corrida.Afijos = afijos;
++    corrida.Instancia = mapa->GetInstanceId();
++    corrida.Lider = lider->GetGUID();
++    corrida.Inicio = time(nullptr);
++    corrida.Prueba = prueba;
++
++    if (Group* grupo = lider->GetGroup())
++        for (GroupReference const& referencia : grupo->GetMembers())
++            if (Player* miembro = referencia.GetSource())
++                corrida.Miembros.push_back(miembro->GetGUID());
++    if (corrida.Miembros.empty())
++        corrida.Miembros.push_back(lider->GetGUID());
++
++    std::string miembros;
++    for (ObjectGuid const& guid : corrida.Miembros)
++        miembros += Trinity::StringFormat("{} ", guid.GetCounter());
++
++    // La piedra se consume al arrancar (como en retail): sale del inventario y su fila se borra.
++    // Vuelve al cerrar la corrida; si el mundo se reinicia en medio, la corrida queda con
++    // piedra_devuelta = 0 y se le devuelve al entrar (DevolverPiedrasPendientes).
++    uint64 guidPiedra = piedra->GetGUID().GetCounter();
++    uint32 cuantas = 1;
++    lider->DestroyItemCount(piedra, cuantas, true);
++    CharacterDatabase.PExecute("DELETE FROM mitica_piedra WHERE item_guid = {}", guidPiedra);
++
++    // Arranca sabiendo si la mazmorra tiene jefes vivos: asi el cierre por jefes no depende de que
++    // la vigilancia alcance a verlos antes de la ultima muerte.
++    corrida.JefesVistos = JefesVivos(mapa, estancia) > 0;
++
++    // Si no hay jefe declarado NI la TDB marca ninguno, o el jefe declarado no esta spawneado, esta
++    // corrida no va a cerrar sola: mejor decirlo en el log que dejar al jugador esperando un cierre
++    // que no llega (se cierra a mano con `.mitica cerrar`).
++    if (!corrida.JefesVistos)
++    {
++        if (estancia->JefeFinal.empty())
++            TC_LOG_WARN("scripts.miticas", "la estancia {} (cm {}) no declara jefe_final y la TDB no marca "
++                "ningun jefe en el mapa {}: la corrida {} no va a cerrar sola (se cierra con .mitica cerrar)",
++                estancia->Nombre, estancia->CmId, estancia->MapId, corrida.Id);
++        else
++            TC_LOG_WARN("scripts.miticas", "el jefe final declarado de {} ({}) no esta vivo (ni spawneado) en "
++                "el mapa {}: la corrida {} no va a cerrar sola (se cierra con .mitica cerrar)",
++                estancia->Nombre, estancia->JefeFinal, estancia->MapId, corrida.Id);
++    }
++
++    CharacterDatabase.PExecute(
++        "INSERT INTO mitica_corrida (corrida_id, cm_id, map_id, nivel, afijos, instancia, lider, miembros, estado) "
++        "VALUES ({}, {}, {}, {}, '{}', {}, {}, '{}', '{}')",
++        corrida.Id, corrida.CmId, corrida.MapId, corrida.NivelKeystone, corrida.Afijos, corrida.Instancia,
++        corrida.Lider.GetCounter(), miembros, prueba ? "prueba" : "en_curso");
++
++    _corridas[corrida.Id] = corrida;
++
++    // Escalado por nivel: se aplica a lo que ya esta cargado en la instancia (vida y dano)
++    EscalarPorNivel(mapa, corrida);
++
++    TC_LOG_INFO("scripts.miticas", "corrida {} ARRANCADA: {} (cm {}, mapa {}, instancia {}) nivel {} por {} "
++        "con {} miembro(s){}", corrida.Id, estancia->Nombre, corrida.CmId, corrida.MapId,
++        corrida.Instancia, corrida.NivelKeystone, lider->GetName(),
++        uint32(corrida.Miembros.size()), prueba ? " [PRUEBA]" : "");
++
++    // Avisos por texto propio (plantillas de mitica_config: se cambian sin recompilar)
++    AvisarAlGrupo(corrida, Plantilla("aviso_arranque", corrida));
++    AvisarAlGrupo(corrida, Plantilla("aviso_tiempos", corrida));
++
++    // Y el paquete del HUD, armado desde la base (formato en reconstruccion), mas el campo de update
++    // del temporizador. Va a TODO el grupo: el HUD es de cada jugador. Los dos paquetes de MYTHIC_PLUS
++    // son los que le avisan al cliente que la temporada esta viva (si no, puede ocultar la UI entera).
++    for (ObjectGuid const& guid : corrida.Miembros)
++        if (Player* miembro = ObjectAccessor::FindConnectedPlayer(guid))
++        {
++            EnviarPaquete(miembro, corrida, "SMSG_MYTHIC_PLUS_SEASON_DATA");
++            EnviarPaquete(miembro, corrida, "SMSG_MYTHIC_PLUS_CURRENT_AFFIXES");
++            EnviarPaquete(miembro, corrida, "SMSG_CHALLENGE_MODE_START");
++            MarcarDesafio(miembro, corrida, true);
++        }
++
++    motivo.clear();
++    return true;
++}
++
++Corrida* Mgr::GetCorridaDe(Player const* jugador)
++{
++    for (auto& [id, corrida] : _corridas)
++        for (ObjectGuid const& guid : corrida.Miembros)
++            if (guid == jugador->GetGUID())
++                return &corrida;
++    return nullptr;
++}
++
++Corrida* Mgr::GetCorridaPorInstancia(uint32 mapId, uint32 instancia)
++{
++    for (auto& [id, corrida] : _corridas)
++        if (corrida.MapId == mapId && corrida.Instancia == instancia)
++            return &corrida;
++    return nullptr;
++}
++
++void Mgr::AgregarMuerte(Player* jugador)
++{
++    Corrida* corrida = GetCorridaDe(jugador);
++    if (!corrida)
++        return;
++
++    ++corrida->Muertes;
++    CharacterDatabase.PExecute("UPDATE mitica_corrida SET muertes = {} WHERE corrida_id = {}",
++        corrida->Muertes, corrida->Id);
++
++    AvisarAlGrupo(*corrida, Plantilla("aviso_muerte", *corrida));
++    EnviarPaquete(jugador, *corrida, "SMSG_CHALLENGE_MODE_UPDATE_DEATH_COUNT");
++}
++
++void Mgr::AgregarFuerzas(Player* jugador, float pct)
++{
++    Corrida* corrida = GetCorridaDe(jugador);
++    if (!corrida || pct <= 0.0f)
++        return;
++
++    corrida->Fuerzas += pct;
++    if (corrida->Fuerzas > 100.0f)
++        corrida->Fuerzas = 100.0f;
++
++    CharacterDatabase.PExecute("UPDATE mitica_corrida SET fuerzas = {} WHERE corrida_id = {}",
++        corrida->Fuerzas, corrida->Id);
++
++    Estancia const* estancia = GetEstancia(corrida->CmId);
++    if (estancia && corrida->Fuerzas >= float(estancia->FuerzasMin))
++        AvisarAlGrupo(*corrida, Plantilla("aviso_fuerzas", *corrida));
++}
++
++std::string Mgr::Medalla(Corrida const& corrida) const
++{
++    Estancia const* estancia = GetEstancia(corrida.CmId);
++    if (!estancia)
++        return "ninguna";
++
++    uint32 tiempo = corrida.SegundosTranscurridos();
++    if (estancia->TiempoOro && tiempo <= estancia->TiempoOro)
++        return "oro";
++    if (estancia->TiempoPlata && tiempo <= estancia->TiempoPlata)
++        return "plata";
++    if (estancia->TiempoBronce && tiempo <= estancia->TiempoBronce)
++        return "bronce";
++    return "ninguna";
++}
++
++// ---------------------------------------------------------------------------
++// Escalado y fuerzas (Fase 1)
++// ---------------------------------------------------------------------------
++// Aplica vida_pct/dano_pct del nivel a las criaturas que YA estan en la instancia (las que spawnean
++// despues, por evento o respawn, todavia no se escalan: esta anotado como pendiente).
++void Mgr::EscalarPorNivel(Map* mapa, Corrida const& corrida) const
++{
++    if (!mapa || ConfigNumero("escalado_vida", 1) == 0)
++        return;
++
++    Nivel const* nivel = GetNivel(corrida.NivelKeystone);
++    if (!nivel)
++        return;
++
++    float factorVida = nivel->VidaPct / 100.0f;
++    float factorDano = nivel->DanoPct / 100.0f;
++    float factorVidaJefe = nivel->JefeVidaPct / 100.0f;
++    float factorDanoJefe = nivel->JefeDanoPct / 100.0f;
++
++    // Paso previo: subir el contenido al nivel del grupo. Las mazmorras de expansiones viejas
++    // traen a sus criaturas en el nivel de esa expansion (p.ej. BfA = 50), asi que una corrida
++    // con personajes del nivel actual se sentiria trivial. Se sube el nivel de cada criatura al
++    // del miembro mas alto del grupo y el core recalcula vida, dano, mana y armadura por nivel.
++    uint8 nivelGrupo = 0;
++    if (ConfigNumero("subir_nivel_grupo", 1) != 0)
++        for (auto const& ref : mapa->GetPlayers())
++            if (Player* jugador = ref.GetSource())
++                if (jugador->GetLevel() > nivelGrupo)
++                    nivelGrupo = jugador->GetLevel();
++
++    // Afijos ESTATICOS de esta corrida: los que son un multiplicador y no un hechizo. Tiránico pega en
++    // los jefes y Reforzado en la chusma; los numeros son NUESTROS y viven en `mitica_afijo.parametros`
++    // ("objetivo=jefes|basura;vida=N;dano=N"), asi que se ajustan sin recompilar. Un afijo sin
++    // `parametros` NO se aplica: no se adivina.
++    float afijoVidaJefe = 1.0f, afijoDanoJefe = 1.0f, afijoVidaBasura = 1.0f, afijoDanoBasura = 1.0f;
++    std::string afijosAplicados;
++
++    for (uint32 afijoId : ListaDeIds(corrida.Afijos))
++    {
++        auto itr = _afijos.find(afijoId);
++        if (itr == _afijos.end() || !itr->second.Activo || itr->second.Implementacion != "estatico")
++            continue;
++
++        std::string const& texto = itr->second.Parametros;
++        float vidaPct = 0.0f, danoPct = 0.0f;
++        if (size_t pos = texto.find("vida="); pos != std::string::npos)
++            vidaPct = float(strtod(texto.c_str() + pos + 5, nullptr));
++        if (size_t pos = texto.find("dano="); pos != std::string::npos)
++            danoPct = float(strtod(texto.c_str() + pos + 5, nullptr));
++
++        bool aJefes = texto.find("objetivo=jefes") != std::string::npos;
++        bool aChusma = texto.find("objetivo=basura") != std::string::npos;
++        if (!aJefes && !aChusma)
++            continue;
++
++        if (aJefes)
++        {
++            afijoVidaJefe *= 1.0f + vidaPct / 100.0f;
++            afijoDanoJefe *= 1.0f + danoPct / 100.0f;
++        }
++        if (aChusma)
++        {
++            afijoVidaBasura *= 1.0f + vidaPct / 100.0f;
++            afijoDanoBasura *= 1.0f + danoPct / 100.0f;
++        }
++
++        if (!afijosAplicados.empty())
++            afijosAplicados += ", ";
++        afijosAplicados += Trinity::StringFormat("{} (vida {}%, dano {}%, {})", itr->second.Nombre,
++            uint32(vidaPct), uint32(danoPct), aJefes ? "jefes" : "chusma");
++    }
++
++    if (!afijosAplicados.empty())
++        TC_LOG_INFO("scripts.miticas", "afijos estaticos de la estancia {}: {}", corrida.CmId, afijosAplicados);
++
++    uint32 escaladas = 0;
++    uint32 subidas = 0;
++    uint32 rotuladas = 0;
++    for (auto const& [spawnId, criatura] : mapa->GetCreatureBySpawnIdStore())
++    {
++        if (!criatura || !criatura->IsAlive())
++            continue;
++
++        // Solo los enemigos de la mazmorra: ni mascotas/invocaciones de jugadores, ni critters, ni
++        // la gente amiga del campamento (escalarlos romperia el contenido de la instancia).
++        if (criatura->IsCritter() || criatura->IsSummon() || criatura->IsPet() || criatura->IsGuardian()
++            || !criatura->GetCharmerOrOwnerGUID().IsEmpty() || !criatura->IsHostileToPlayers())
++            continue;
++
++        if (nivelGrupo && criatura->GetLevel() != nivelGrupo)
++        {
++            criatura->SetLevel(nivelGrupo);
++            criatura->UpdateLevelDependantStats();
++            ++subidas;
++        }
++
++        // El nivel que el cliente ROTULA la criatura no sale de UNIT_FIELD_LEVEL sino del escalado del
++        // contenido (clamp(nivelDelJugador, ScalingLevelMin, ScalingLevelMax) + ScalingLevelDelta), y el
++        // ContentTuning de una expansion vieja topa en su propio nivel (BfA = 50). Sin esta linea el
++        // servidor tiene al bicho en 90 y el jugador lo sigue leyendo en 50.
++        if (nivelGrupo)
++        {
++            criatura->SetScaledDisplayLevel(nivelGrupo);
++            ++rotuladas;
++        }
++
++        bool jefe = criatura->IsDungeonBoss();
++        float vida = factorVida * (jefe ? factorVidaJefe : 1.0f) * (jefe ? afijoVidaJefe : afijoVidaBasura);
++        float dano = factorDano * (jefe ? factorDanoJefe : 1.0f) * (jefe ? afijoDanoJefe : afijoDanoBasura);
++
++        uint64 vidaMaxima = uint64(double(criatura->GetMaxHealth()) * vida);
++        criatura->SetMaxHealth(vidaMaxima);
++        criatura->SetHealth(vidaMaxima);
++
++        for (WeaponAttackType tipo : { BASE_ATTACK, OFF_ATTACK, RANGED_ATTACK })
++        {
++            criatura->SetBaseWeaponDamage(tipo, MINDAMAGE, criatura->GetWeaponDamageRange(tipo, MINDAMAGE) * dano);
++            criatura->SetBaseWeaponDamage(tipo, MAXDAMAGE, criatura->GetWeaponDamageRange(tipo, MAXDAMAGE) * dano);
++            criatura->UpdateDamagePhysical(tipo);
++        }
++        ++escaladas;
++    }
++
++    TC_LOG_INFO("scripts.miticas", "escalado del nivel {} aplicado a {} criaturas (vida x{:.2f}, dano x{:.2f}); {} criaturas subidas al nivel {} del grupo y {} con el nivel del cliente ajustado",
++        corrida.NivelKeystone, escaladas, factorVida, factorDano, subidas, uint32(nivelGrupo), rotuladas);
++}
++
++// Fuerzas que aporta una criatura al morir: primero la tabla por criatura, si no la regla por
++// clasificacion (todo configurable en mitica_config).
++float Mgr::FuerzasDeCriatura(Creature* criatura, Corrida const* corrida) const
++{
++    if (!criatura)
++        return 0.0f;
++
++    if (QueryResult explicito = WorldDatabase.PQuery(
++            "SELECT pct FROM mitica_fuerzas WHERE entry = {}", criatura->GetEntry()))
++        return explicito->Fetch()[0].GetFloat();
++
++    // El jefe final declarado no aporta fuerzas (en retail los jefes no cuentan para el % de fuerzas).
++    // OJO: NO se puede confiar en IsDungeonBoss() para esto: la TDB no marca como jefe a NINGUNA
++    // criatura de estas mazmorras (flags_extra = 0 en las 3.264 spawneadas de las 8 estancias), asi
++    // que el unico dato confiable es el que declaramos en mitica_estancia.jefe_final.
++    Estancia const* estancia = corrida ? GetEstancia(corrida->CmId) : nullptr;
++    if (EsJefeFinal(estancia, criatura->GetEntry()))
++        return 0.0f;
++
++    if (criatura->IsDungeonBoss())
++        return 0.0f;
++
++    // Regla por clasificacion: es lo que promete el DDL de `mitica_fuerzas` ("lo no listado usa la regla
++    // por clasificacion") y lo que estaban declarando sin efecto las claves `fuerzas_elite`, `fuerzas_rare`
++    // y `fuerzas_rareelite` de `mitica_config`: hasta ahora TODO lo que no era jefe aportaba
++    // `fuerzas_normal` (1), asi que una elite aportaba lo mismo que un mob suelto.
++    // Ojo: no existe una clasificacion "jefe" en este enum (Normal/Elite/RareElite/Obsolete/Rare/...): los
++    // jefes de estas mazmorras no se pueden distinguir por clasificacion, y es por eso que los jefes van
++    // declarados a mano en `mitica_fuerzas` con pct = 0.
++    switch (criatura->GetCreatureClassification())
++    {
++        case CreatureClassifications::RareElite: return float(ConfigNumero("fuerzas_rareelite", 3));
++        case CreatureClassifications::Rare:      return float(ConfigNumero("fuerzas_rare", 2));
++        case CreatureClassifications::Elite:     return float(ConfigNumero("fuerzas_elite", 2));
++        default:                                 return float(ConfigNumero("fuerzas_normal", 1));
++    }
++}
++
++bool Mgr::Cerrar(Corrida& corrida, bool fueraDeTiempo, std::string& motivo)
++{
++    uint32 tiempo = corrida.SegundosTranscurridos();
++    std::string medalla = fueraDeTiempo ? "ninguna" : Medalla(corrida);
++    char const* estado = fueraDeTiempo ? "fuera_de_tiempo" : "completada";
++
++    GuardarCorrida(corrida, estado, medalla.c_str(), tiempo);
++
++    AvisarAlGrupo(corrida, Plantilla("aviso_cierre", corrida,
++        { { "tiempo", Trinity::StringFormat("{} min {} s", tiempo / 60, tiempo % 60) },
++          { "medalla", medalla } }));
++
++    // El puntaje de la corrida. Retail usa una formula propia (base por calabozo, escalado por nivel,
++    // bono por tiempo y penalizacion por muertes, comparada contra la mejor corrida de ese calabozo).
++    // Aca va UNA formula nuestra, simple y explicita, con todas las constantes en `mitica_config` para
++    // ajustarla sin recompilar:  base + nivel x por_nivel + bono de medalla - muertes x por_muerte.
++    corrida.Puntos = CalcularPuntos(corrida, medalla);
++
++    // El paquete de cierre va a TODO el grupo (antes iba solo a quien lo disparaba), y con el se quita
++    // el campo del temporizador: si queda marcado, el cliente cree que la mítica+ sigue corriendo.
++    for (ObjectGuid const& guid : corrida.Miembros)
++        if (Player* miembro = ObjectAccessor::FindConnectedPlayer(guid))
++        {
++            EnviarPaquete(miembro, corrida, "SMSG_CHALLENGE_MODE_COMPLETE");
++            MarcarDesafio(miembro, corrida, false);
++        }
++
++    TC_LOG_INFO("scripts.miticas", "corrida {} CERRADA: {} nivel {} en {} s (medalla {}, {} muertes, fuerzas {:.1f}%, {} puntos)",
++        corrida.Id, GetEstancia(corrida.CmId) ? GetEstancia(corrida.CmId)->Nombre : "?",
++        corrida.NivelKeystone, tiempo, medalla, corrida.Muertes, corrida.Fuerzas, corrida.Puntos);
++
++    // El NPC de salida: aparece junto al lider para que el grupo pueda volver a la ciudad sin
++    // caminar toda la mazmorra. El destino sale de `salida_punto` (el trigger de salida del cliente).
++    if (Estancia const* estancia = GetEstancia(corrida.CmId))
++    {
++        if (estancia->SalidaNpc)
++        {
++            Map* mapa = sMapMgr->FindMap(corrida.MapId, corrida.Instancia);
++            Player* lider = ObjectAccessor::FindConnectedPlayer(corrida.Lider);
++            if (mapa && lider)
++            {
++                Position pos(lider->GetPositionX(), lider->GetPositionY(), lider->GetPositionZ(), lider->GetOrientation());
++                if (TempSummon* guia = mapa->SummonCreature(estancia->SalidaNpc, pos))
++                {
++                    guia->SetFaction(35);
++                    TC_LOG_INFO("scripts.miticas", "corrida {}: aparecio el guia de salida (entry {}) junto al lider en {}",
++                        corrida.Id, estancia->SalidaNpc, estancia->Nombre);
++                }
++                else
++                    TC_LOG_ERROR("scripts.miticas", "corrida {}: no se pudo invocar el guia de salida {}", corrida.Id, estancia->SalidaNpc);
++            }
++        }
++    }
++
++    // La piedra vuelve a quien la puso, y sube de nivel si la medalla fue oro y la config lo pide.
++    DevolverPiedra(corrida, corrida.NivelKeystone,
++        medalla == "oro" && ConfigNumero("piedra_sube_con_oro", 1) != 0);
++
++    // El cofre de recompensa: aparece junto al grupo al cerrar. El botin lo entrega nuestra IA cuando
++    // el jugador le hace clic (el core no tiene logica para el tipo 51; el objeto pasa a goober).
++    if (uint32 cofreGo = ConfigNumero("cofre_go", 0))
++    {
++        Map* mapa = sMapMgr->FindMap(corrida.MapId, corrida.Instancia);
++        Player* lider = ObjectAccessor::FindConnectedPlayer(corrida.Lider);
++        if (mapa && lider)
++        {
++            Position pos(lider->GetPositionX(), lider->GetPositionY(), lider->GetPositionZ(), lider->GetOrientation());
++            // Ojo con el tiempo: `SummonGameObject` hace `SetRespawnTime(respawnTime)`, y con 0 el
++            // objeto queda con el respawn vencido y desaparece en el tick siguiente. Una hora alcanza:
++            // la instancia se descarga mucho antes y el objeto no se guarda en la base.
++            if (GameObject* cofre = lider->SummonGameObject(cofreGo, pos, QuaternionData(), Seconds(3600),
++                    GO_SUMMON_TIMED_DESPAWN))
++                TC_LOG_INFO("scripts.miticas", "corrida {}: aparecio el cofre de recompensa ({}) con el grupo", corrida.Id, cofreGo);
++            else
++                TC_LOG_ERROR("scripts.miticas", "corrida {}: no se pudo invocar el cofre {}", corrida.Id, cofreGo);
++        }
++    }
++
++    // NO se borra: el cofre y el guia de salida siguen vivos despues del cierre y necesitan esta
++    // corrida (de aca sale el nivel de la piedra con el que se escalona el botin).
++    corrida.Cerrada = true;
++    motivo.clear();
++    return true;
++}
++
++// ---------------------------------------------------------------------------
++// Cierre por jefes: NO depende de quien mato al jefe
++// ---------------------------------------------------------------------------
++// El gancho de TrinityCore (PlayerScript::OnCreatureKill) solo se dispara cuando la muerte se le
++// puede atribuir a un jugador. Una muerte por comando de GM (`.die`), por una trampa del entorno o
++// por un tercero no pasa por ahi, y la corrida se quedaba abierta aunque el jefe estuviera muerto
++// (visto en vivo: fuerzas al 100 %, Yazma muerto con .die y la corrida sin cerrar). Por eso el
++// cierre se decide MIRANDO la instancia, no el evento.
++uint32 Mgr::JefesVivos(Map* mapa, Estancia const* estancia) const
++{
++    if (!mapa)
++        return 0;
++
++    std::vector<uint32> declarados = estancia ? ListaDeIds(estancia->JefeFinal) : std::vector<uint32>();
++    uint32 vivos = 0;
++    for (auto const& [spawnId, criatura] : mapa->GetCreatureBySpawnIdStore())
++    {
++        if (!criatura)
++            continue;
++
++        // Con jefe_final declarado manda esa lista (un encuentro puede ser de varias criaturas);
++        // sin el, cualquier jefe de la mazmorra marcado como tal vale.
++        bool cuenta = declarados.empty() ? criatura->IsDungeonBoss() : EsJefeFinal(estancia, criatura->GetEntry());
++        if (!cuenta)
++            continue;
++
++        if (criatura->IsAlive())
++            ++vivos;
++    }
++    return vivos;
++}
++
++bool Mgr::EsJefeFinal(Estancia const* estancia, uint32 entry) const
++{
++    if (!estancia || estancia->JefeFinal.empty())
++        return false;
++
++    for (uint32 declarado : ListaDeIds(estancia->JefeFinal))
++        if (declarado == entry)
++            return true;
++
++    return false;
++}
++
++void Mgr::Vigilar()
++{
++    if (!_configCargada || _corridas.empty() || ConfigNumero("cierre_por_jefes", 1) == 0)
++        return;
++
++    std::vector<uint64> cerrar;
++    for (auto& [id, corrida] : _corridas)
++    {
++        if (corrida.Cerrada)
++            continue;   // ya cerro: el cofre y el guia siguen vivos, pero no hay nada mas que vigilar
++
++        Map* mapa = sMapMgr->FindMap(corrida.MapId, corrida.Instancia);
++        if (!mapa)
++            continue;   // la instancia no esta cargada: no hay jefes que mirar
++
++        // Red de seguridad del recorrido: si el lider se quedo parado al lado de una reja cerrada,
++        // se abre (es lo unico que garantiza que la corrida no se trabe por un dato que falte).
++        if (VigilarRecorrido(corrida, mapa))
++            TC_LOG_INFO("scripts.miticas", "recorrido: la corrida {} lleva {} objeto(s) abiertos por el vigilante",
++                corrida.Id, corrida.TrabasAbiertas);
++
++        // Camino central (como retail): cuando mueren los jefes de antes se abre el paso al jefe
++        // final. Abrir esa puerta dispara el movimiento de la escalera: esa es la "cinematica".
++        if (AbrirCaminoCentral(corrida, mapa))
++            TC_LOG_INFO("scripts.miticas", "camino central abierto en la corrida {}", corrida.Id);
++
++        Estancia const* estancia = GetEstancia(corrida.CmId);
++
++        // "Fuerzas completas" no cierra la corrida en retail: habilita el jefe final. Se avisa una
++        // sola vez y se dice que falta, que es la duda que quedaba en la prueba en vivo.
++        if (estancia && !corrida.AvisoFuerzas && corrida.Fuerzas >= float(estancia->FuerzasMin))
++        {
++            corrida.AvisoFuerzas = true;
++            AvisarAlGrupo(corrida, Plantilla("aviso_fuerzas_falta", corrida));
++        }
++
++        uint32 vivos = JefesVivos(mapa, estancia);
++        if (vivos)
++        {
++            corrida.JefesVistos = true;
++            continue;
++        }
++
++        if (corrida.JefesVistos)
++            cerrar.push_back(id);
++    }
++
++    for (uint64 id : cerrar)
++    {
++        auto itr = _corridas.find(id);
++        if (itr == _corridas.end())
++            continue;
++
++        std::string motivo;
++        if (Cerrar(itr->second, false, motivo))
++            TC_LOG_INFO("scripts.miticas", "corrida {} cerrada por la vigilancia: no queda ningun jefe vivo en la instancia", id);
++        else
++            TC_LOG_ERROR("scripts.miticas", "la corrida {} no se pudo cerrar: {}", id, motivo);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Red de seguridad del recorrido
++// ---------------------------------------------------------------------------
++namespace
++{
++    // Tipos de gameobject que pueden TRABAR el paso. Los demas (palancas `GOOBER`, focos de hechizo,
++    // cofres) son mecanica del encuentro: abrirlos a lo bruto cambiaria la pelea, asi que no se tocan.
++    bool EsObjetoDePaso(GameObject const* objeto)
++    {
++        if (!objeto)
++            return false;
++
++        GameobjectTypes tipo = objeto->GetGoType();
++        return tipo == GAMEOBJECT_TYPE_DOOR || tipo == GAMEOBJECT_TYPE_DESTRUCTIBLE_BUILDING;
++    }
++
++    // Esta cerrado? Para una puerta, `GO_STATE_READY` = cerrada; para un muro destructible, intacto.
++    bool EstaCerrado(GameObject const* objeto)
++    {
++        if (!objeto)
++            return false;
++
++        if (objeto->GetGoType() == GAMEOBJECT_TYPE_DOOR)
++            return objeto->GetGoState() == GO_STATE_READY;
++
++        return objeto->GetDestructibleState() == GO_DESTRUCTIBLE_INTACT;
++    }
++
++    // Abre el paso con el MISMO camino que usa un jugador (para la puerta) o lo da por destruido.
++    void AbrirPaso(GameObject* objeto)
++    {
++        if (objeto->GetGoType() == GAMEOBJECT_TYPE_DOOR)
++            objeto->UseDoorOrButton();
++        else
++            objeto->SetDestructibleState(GO_DESTRUCTIBLE_DESTROYED);
++    }
++
++    std::string NombreObjeto(GameObject const* objeto, uint32 spawnId)
++    {
++        return Trinity::StringFormat("{} (spawnId {})", objeto->GetName(), spawnId);
++    }
++
++    float Distancia(float ax, float ay, float az, float bx, float by, float bz)
++    {
++        float dx = ax - bx;
++        float dy = ay - by;
++        float dz = az - bz;
++        return std::sqrt(dx * dx + dy * dy + dz * dz);
++    }
++}
++
++uint32 Mgr::ContarTrabas(Map* mapa, std::string& detalle) const
++{
++    detalle.clear();
++    if (!mapa)
++        return 0;
++
++    uint32 cerrados = 0;
++    for (auto const& [spawnId, objeto] : mapa->GetGameObjectBySpawnIdStore())
++    {
++        if (!EsObjetoDePaso(objeto) || !EstaCerrado(objeto))
++            continue;
++
++        ++cerrados;
++        if (cerrados > 1)
++            detalle += ", ";
++        detalle += NombreObjeto(objeto, spawnId);
++    }
++    return cerrados;
++}
++
++uint32 Mgr::Destrabar(Map* mapa, std::string& detalle) const
++{
++    detalle.clear();
++    if (!mapa)
++        return 0;
++
++    uint32 abiertos = 0;
++    for (auto const& [spawnId, objeto] : mapa->GetGameObjectBySpawnIdStore())
++    {
++        if (!EsObjetoDePaso(objeto) || !EstaCerrado(objeto))
++            continue;
++
++        AbrirPaso(objeto);
++        ++abiertos;
++        if (abiertos > 1)
++            detalle += ", ";
++        detalle += NombreObjeto(objeto, spawnId);
++        TC_LOG_INFO("scripts.miticas", "recorrido: destrabado {} en el mapa {}", NombreObjeto(objeto, spawnId), mapa->GetId());
++    }
++
++    // El destrabar manual es la ULTIMA salida: ademas de las puertas, saca las paredes de colision
++    // declaradas para ese mapa (gameobjects genericos, tipo 5, que el resto de la red no toca).
++    for (Estancia const& estancia : _estancias)
++    {
++        if (estancia.MapId != mapa->GetId() || estancia.CaminoQuitar.empty())
++            continue;
++
++        std::string paredes;
++        if (uint32 quitadas = QuitarParedes(mapa, ListaDeIds(estancia.CaminoQuitar), paredes))
++        {
++            abiertos += quitadas;
++            if (!detalle.empty())
++                detalle += ", ";
++            detalle += "pared(es) de colision: " + paredes;
++        }
++    }
++
++    return abiertos;
++}
++
++// --- camino central (como retail) ---------------------------------------------------------------
++// El paso al jefe final se abre cuando mueren los jefes declarados en la estancia (`camino_jefes`),
++// igual que en retail. Abrir la puerta dispara la animacion propia del objeto -- eso ES la
++// "cinematica" del pasillo (el movimiento de la escalera): no hay ninguna pelicula que mandar.
++uint32 Mgr::JefesVivosDeLista(Map* mapa, std::vector<uint32> const& entries) const
++{
++    if (!mapa || entries.empty())
++        return 0;
++
++    uint32 vivos = 0;
++    for (auto const& [spawnId, criatura] : mapa->GetCreatureBySpawnIdStore())
++    {
++        if (!criatura || !criatura->IsAlive())
++            continue;
++
++        for (uint32 entry : entries)
++        {
++            if (criatura->GetEntry() == entry)
++            {
++                ++vivos;
++                break;
++            }
++        }
++    }
++    return vivos;
++}
++
++uint32 Mgr::QuitarParedes(Map* mapa, std::vector<uint32> const& spawnIds, std::string& detalle) const
++{
++    detalle.clear();
++    if (!mapa || spawnIds.empty())
++        return 0;
++
++    uint32 quitados = 0;
++    auto const& objetos = mapa->GetGameObjectBySpawnIdStore();
++    for (uint32 spawnId : spawnIds)
++    {
++        auto itr = objetos.find(spawnId);
++        if (itr == objetos.end() || !itr->second)
++            continue;
++
++        GameObject* objeto = itr->second;
++        if (quitados)
++            detalle += ", ";
++        detalle += NombreObjeto(objeto, spawnId);
++        TC_LOG_INFO("scripts.miticas", "camino central: despenzado {} en el mapa {}",
++            NombreObjeto(objeto, spawnId), mapa->GetId());
++        objeto->Delete();
++        ++quitados;
++    }
++    return quitados;
++}
++
++bool Mgr::AbrirCaminoCentral(Corrida& corrida, Map* mapa)
++{
++    if (!mapa || corrida.CaminoAbierto || ConfigNumero("camino_central", 1) == 0)
++        return false;
++
++    Estancia const* estancia = GetEstancia(corrida.CmId);
++    if (!estancia || !estancia->CaminoGo)
++        return false;
++
++    std::vector<uint32> jefes = ListaDeIds(estancia->CaminoJefes);
++    if (jefes.empty())
++        return false;
++
++    if (JefesVivosDeLista(mapa, jefes) > 0)
++    {
++        corrida.CaminoVistos = true;
++        return false;
++    }
++
++    // La instancia acaba de cargar y todavia no se vio a ninguno vivo: no se adelanta el diseño.
++    if (!corrida.CaminoVistos)
++        return false;
++
++    // Las paredes de colision del paso (gameobjects genericos tipo 5) no las toca ni el vigilante ni
++    // `.mitica destrabar` salvo que esten declaradas: se despenzan ACA, cuando el camino al jefe final
++    // queda efectivamente abierto. OJO: va ANTES del `return` del objeto ya abierto -- la escalera de
++    // Atal'Dazar arranca abierta (`state = 1`), asi que aquel return se iba sin quitar la pared y la
++    // corrida terminaba trabada contra una pared invisible con la escalera abierta (visto en vivo).
++    std::string paredes;
++    uint32 quitadas = QuitarParedes(mapa, ListaDeIds(estancia->CaminoQuitar), paredes);
++    if (quitadas)
++        TC_LOG_INFO("scripts.miticas", "camino central: {} pared(es) de colision despenzadas: {}",
++            quitadas, paredes);
++
++    auto itr = mapa->GetGameObjectBySpawnIdStore().find(estancia->CaminoGo);
++    if (itr == mapa->GetGameObjectBySpawnIdStore().end() || !itr->second)
++    {
++        TC_LOG_ERROR("scripts.miticas", "camino central: la corrida {} no encuentra el objeto {} en el mapa {}",
++            corrida.Id, estancia->CaminoGo, mapa->GetId());
++        return quitadas > 0;
++    }
++
++    GameObject* objeto = itr->second;
++    if (!EstaCerrado(objeto))
++    {
++        corrida.CaminoAbierto = true;   // ya estaba abierto: lo dejo anotado y no repito
++        if (quitadas)
++        {
++            std::string texto = Plantilla("aviso_camino", corrida);
++            if (!texto.empty() && texto != "aviso_camino")
++                AvisarAlGrupo(corrida, texto);
++        }
++        return quitadas > 0;
++    }
++
++    AbrirPaso(objeto);
++    corrida.CaminoAbierto = true;
++    TC_LOG_INFO("scripts.miticas", "camino central: la corrida {} abrio {} (spawnId {}) al morir los jefes [{}]",
++        corrida.Id, objeto->GetName(), estancia->CaminoGo, estancia->CaminoJefes);
++
++    std::string texto = Plantilla("aviso_camino", corrida);
++    if (!texto.empty() && texto != "aviso_camino")
++        AvisarAlGrupo(corrida, texto);
++
++    return true;
++}
++
++uint32 Mgr::VigilarRecorrido(Corrida& corrida, Map* mapa)
++{
++    if (!mapa || ConfigNumero("recorrido_vigilar", 1) == 0)
++        return 0;
++
++    Player* lider = ObjectAccessor::FindConnectedPlayer(corrida.Lider);
++    if (!lider || lider->GetMap() != mapa)
++        return 0;
++
++    uint32 cada = ConfigNumero("vigilancia_seg", 5);
++    if (!cada)
++        cada = 5;
++
++    float x = lider->GetPositionX();
++    float y = lider->GetPositionY();
++    float z = lider->GetPositionZ();
++
++    if (!corrida.PosicionInicial)
++    {
++        corrida.UltimaX = x;
++        corrida.UltimaY = y;
++        corrida.UltimaZ = z;
++        corrida.PosicionInicial = true;
++        return 0;
++    }
++
++    if (Distancia(x, y, z, corrida.UltimaX, corrida.UltimaY, corrida.UltimaZ) > 2.0f)
++    {
++        corrida.UltimaX = x;
++        corrida.UltimaY = y;
++        corrida.UltimaZ = z;
++        corrida.QuietoSeg = 0;
++        return 0;
++    }
++
++    corrida.QuietoSeg += cada;
++    uint32 quieto = corrida.QuietoSeg;
++    if (quieto < ConfigNumero("recorrido_quieto_seg", 20))
++        return 0;
++
++    corrida.QuietoSeg = 0;   // si sigue trabado, se vuelve a mirar en la proxima vuelta
++
++    float radio = float(ConfigNumero("recorrido_radio_yd", 10));
++    Estancia const* estancia = GetEstancia(corrida.CmId);
++    for (auto const& [spawnId, objeto] : mapa->GetGameObjectBySpawnIdStore())
++    {
++        if (!EsObjetoDePaso(objeto) || !EstaCerrado(objeto))
++            continue;
++
++        // El paso al jefe final lo abre el DISEÑO (AbrirCaminoCentral, cuando mueren los jefes de
++        // antes). Si el vigilante lo abriera solo, el jugador pasaria al jefe final sin pelear nada:
++        // mientras quede VIVO alguno de los jefes de `camino_jefes`, esa puerta es del diseño. Cuando
++        // ya no queda ninguno, la puerta deja de estar protegida y el vigilante tambien la puede abrir
++        // (es la red: si el diseño fallo -- objeto mal declarado, jefe que no muere -- la corrida no
++        // se traba igual).
++        if (estancia && estancia->CaminoGo && spawnId == estancia->CaminoGo)
++        {
++            std::vector<uint32> jefesCamino = ListaDeIds(estancia->CaminoJefes);
++            if (!jefesCamino.empty() && JefesVivosDeLista(mapa, jefesCamino) > 0)
++                continue;
++        }
++
++        float d = Distancia(x, y, z, objeto->GetPositionX(), objeto->GetPositionY(), objeto->GetPositionZ());
++        if (d > radio)
++            continue;
++
++        AbrirPaso(objeto);
++        ++corrida.TrabasAbiertas;
++        TC_LOG_INFO("scripts.miticas",
++            "recorrido: la corrida {} estuvo {} s parada a {:.1f} yd de {}; el vigilante la abrio (lleva {})",
++            corrida.Id, quieto, d, NombreObjeto(objeto, spawnId), corrida.TrabasAbiertas);
++
++        std::string texto = Plantilla("aviso_destrabado", corrida);
++        if (!texto.empty() && texto != "aviso_destrabado")
++            AvisarAlGrupo(corrida, texto);
++
++        return 1;
++    }
++
++    // Las paredes de colision declaradas (gameobjects genericos tipo 5) NO son objetos de paso para el
++    // vigilante, pero son las que mas traban (visto en vivo en Atal'Dazar: la escalera abierta y una
++    // pared invisible delante). Si el grupo queda parado al lado de una, se despenza igual que una
++    // puerta: es la misma red, un paso mas. El comando manual tambien las quita.
++    if (estancia && !estancia->CaminoQuitar.empty())
++    {
++        for (uint32 spawnId : ListaDeIds(estancia->CaminoQuitar))
++        {
++            auto itr = mapa->GetGameObjectBySpawnIdStore().find(spawnId);
++            if (itr == mapa->GetGameObjectBySpawnIdStore().end() || !itr->second)
++                continue;
++
++            GameObject* pared = itr->second;
++            float d = Distancia(x, y, z, pared->GetPositionX(), pared->GetPositionY(), pared->GetPositionZ());
++            if (d > radio)
++                continue;
++
++            std::string nombre = NombreObjeto(pared, spawnId);
++            pared->Delete();
++            ++corrida.TrabasAbiertas;
++            TC_LOG_INFO("scripts.miticas",
++                "recorrido: la corrida {} estuvo {} s parada a {:.1f} yd de una pared de colision {}; el vigilante la despenzo (lleva {})",
++                corrida.Id, quieto, d, nombre, corrida.TrabasAbiertas);
++
++            std::string texto = Plantilla("aviso_destrabado", corrida);
++            if (!texto.empty() && texto != "aviso_destrabado")
++                AvisarAlGrupo(corrida, texto);
++
++            return 1;
++        }
++    }
++
++    return 0;
++}
++
++// Punto de salida declarado para la estancia de ese mapa (formato "mapa x y z o"). Es el que usa el
++// NPC de salida; sale del propio trigger de salida del cliente, no de una invencion nuestra.
++bool Mgr::PuntoDeSalida(uint32 mapId, uint32& mapaDestino, float& x, float& y, float& z, float& o) const
++{
++    for (Estancia const& estancia : _estancias)
++    {
++        if (estancia.MapId != mapId || estancia.SalidaPunto.empty())
++            continue;
++
++        if (sscanf(estancia.SalidaPunto.c_str(), "%u %f %f %f %f", &mapaDestino, &x, &y, &z, &o) == 5 && mapaDestino)
++            return true;
++    }
++    return false;
++}
++
++// El puntaje de la corrida, con una formula NUESTRA (retail usa la suya y es bastante mas compleja:
++// compara contra la mejor corrida del calabozo, ajusta por el nivel del grupo, etc.). Importa que sea
++// explicita y ajustable: todas las constantes viven en `mitica_config`.
++uint32 Mgr::CalcularPuntos(Corrida const& corrida, std::string const& medalla) const
++{
++    uint32 base = uint32(ConfigNumero("puntos_base", 25));
++    uint32 porNivel = uint32(ConfigNumero("puntos_por_nivel", 12));
++    uint32 porMuerte = uint32(ConfigNumero("puntos_por_muerte", 3));
++
++    uint32 bono = 0;
++    if (medalla == "oro")
++        bono = uint32(ConfigNumero("puntos_oro", 15));
++    else if (medalla == "plata")
++        bono = uint32(ConfigNumero("puntos_plata", 8));
++    else if (medalla == "bronce")
++        bono = uint32(ConfigNumero("puntos_bronce", 0));
++
++    int64 puntos = int64(base) + int64(corrida.NivelKeystone) * int64(porNivel) + int64(bono)
++        - int64(corrida.Muertes) * int64(porMuerte);
++
++    return puntos > 0 ? uint32(puntos) : 0;
++}
++
++// El cofre de recompensa. Lo llama la IA del gameobject (go_cofre_mitica) cuando un jugador le hace
++// clic. Entrega UN item del botin de la estancia, escalado con el NIVEL DE LA PIEDRA de esa corrida:
++// el nivel no sale del DB2, sale del contexto + el nivel (`ItemBonusGenerationParams`), que es lo que
++// hace que el objeto no llegue "pelado" (mismo error que hacia `.send items` a nivel base).
++bool Mgr::AbrirCofre(Player* jugador)
++{
++    if (!jugador)
++        return false;
++
++    Corrida* corrida = nullptr;
++    for (auto& [id, c] : _corridas)
++        if (c.MapId == jugador->GetMapId() && (c.Instancia == 0 || c.Instancia == jugador->GetInstanceId()))
++        {
++            corrida = &c;
++            break;
++        }
++
++    // El cofre solo reparte despues del cierre: ahi ya se sabe la medalla, el tiempo y el nivel.
++    if (!corrida || !corrida->Cerrada)
++        return false;
++
++    if (std::find(corrida->CofreLooteado.begin(), corrida->CofreLooteado.end(), jugador->GetGUID()) != corrida->CofreLooteado.end())
++    {
++        jugador->GetSession()->SendNotification("Ya sacaste tu recompensa de esta corrida.");
++        return true;
++    }
++
++    Estancia const* estancia = GetEstancia(corrida->CmId);
++    if (!estancia || estancia->CofreItems.empty())
++    {
++        TC_LOG_ERROR("scripts.miticas", "cofre: la corrida {} no tiene botin declarado en mitica_cofre_item", corrida->Id);
++        jugador->GetSession()->SendNotification("Este cofre no tiene recompensa configurada.");
++        return true;
++    }
++
++    uint32 itemId = estancia->CofreItems[urand(0, uint32(estancia->CofreItems.size()) - 1)];
++    std::vector<int32> bonos = ItemBonusMgr::GetBonusListsForItem(itemId,
++        ItemBonusMgr::ItemBonusGenerationParams(ItemContext::MythicPlus_End_of_Run, int32(corrida->NivelKeystone)));
++
++    bool entregado = false;
++
++    // 1) a la mochila. StoreItem se lleva el item YA armado, asi que los bonus calculados con el nivel
++    //    de piedra viajan tal cual (StoreNewItem por id volveria a calcularlos sin el nivel).
++    ItemPosCountVec destino;
++    if (jugador->CanStoreNewItem(NULL_BAG, NULL_SLOT, destino, itemId, 1) == EQUIP_ERR_OK)
++    {
++        if (Item* nuevo = Item::CreateItem(itemId, 1, ItemContext::MythicPlus_End_of_Run, jugador, false))
++        {
++            nuevo->SetBonuses(bonos);
++            if (Item* guardado = jugador->StoreItem(destino, nuevo, true))
++            {
++                jugador->SendNewItem(guardado, 1, true, false);
++                entregado = true;
++            }
++            else
++                delete nuevo;
++        }
++    }
++
++    // 2) sin espacio: por correo, el mismo camino que `.mitica obsequio`.
++    if (!entregado)
++    {
++        if (Item* item = Item::CreateItem(itemId, 1, ItemContext::MythicPlus_End_of_Run, jugador, false))
++        {
++            item->SetBonuses(bonos);
++
++            CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
++            MailSender remitente(MAIL_NORMAL, 0, MAIL_STATIONERY_GM);
++            MailDraft("Recompensa de la mitica+", "El cofre de la expedicion: lo que no entro en tus bolsas.")
++                .AddItem(item).SendMailTo(trans, MailReceiver(jugador), remitente);
++            CharacterDatabase.CommitTransaction(trans);
++
++            entregado = true;
++            TC_LOG_INFO("scripts.miticas", "cofre: a {} le fue por correo el item {} (sin espacio en las bolsas)",
++                jugador->GetName(), itemId);
++        }
++    }
++
++    if (entregado)
++    {
++        corrida->CofreLooteado.push_back(jugador->GetGUID());
++        TC_LOG_INFO("scripts.miticas", "cofre: {} saco el item {} (nivel de piedra {}) en la corrida {}",
++            jugador->GetName(), itemId, corrida->NivelKeystone, corrida->Id);
++    }
++
++    return entregado;
++}
++
++Map* Mgr::MapaDeEstancia(uint32 cmId) const
++{
++    for (auto const& [id, corrida] : _corridas)
++    {
++        if (corrida.CmId != cmId)
++            continue;
++
++        if (Map* mapa = sMapMgr->FindMap(corrida.MapId, corrida.Instancia))
++            return mapa;
++    }
++    return nullptr;
++}
++
++std::string Mgr::DiagnosticoRecorrido(Map* mapa, Estancia const* estancia,
++    float desdeX, float desdeY, float desdeZ) const
++{
++    if (!mapa)
++        return "No hay instancia cargada para esa estancia (nadie esta adentro ahora).";
++
++    std::string salida = Trinity::StringFormat("Recorrido de {} (mapa {}):\n",
++        estancia ? estancia->Nombre : "la instancia", mapa->GetId());
++
++    std::string detalle;
++    uint32 cerrados = ContarTrabas(mapa, detalle);
++    salida += Trinity::StringFormat("  objetos de paso CERRADOS: {}", cerrados);
++    salida += cerrados ? Trinity::StringFormat(" -> {}\n", detalle) : "\n";
++
++    float radio = float(ConfigNumero("traba_radio_yd", 6));
++
++    std::vector<uint32> jefes = estancia ? ListaDeIds(estancia->JefeFinal) : std::vector<uint32>();
++    if (jefes.empty())
++        salida += "  (la estancia no tiene jefe_final declarado: no hay destino que medir)\n";
++
++    for (uint32 entry : jefes)
++    {
++        Creature* jefe = nullptr;
++        for (auto const& [spawnId, criatura] : mapa->GetCreatureBySpawnIdStore())
++        {
++            if (criatura && criatura->GetEntry() == entry)
++            {
++                jefe = criatura;
++                break;
++            }
++        }
++
++        if (!jefe)
++        {
++            salida += Trinity::StringFormat("  jefe {}: NO esta en la instancia\n", entry);
++            continue;
++        }
++
++        // El generador de caminos se apoya en un objeto del mundo: da igual la direccion, asi que
++        // se usa al propio jefe y se calcula el camino hasta el punto de partida.
++        PathGenerator camino(jefe);
++        if (!camino.CalculatePath(desdeX, desdeY, desdeZ, false))
++        {
++            salida += Trinity::StringFormat("  jefe {} ({}): el generador NO encontro ruta (tipo {})\n",
++                entry, jefe->GetName(), uint32(camino.GetPathType()));
++            continue;
++        }
++
++        auto const& puntos = camino.GetPath();
++        uint32 trabas = 0;
++        std::string cuales;
++        for (auto const& [spawnId, objeto] : mapa->GetGameObjectBySpawnIdStore())
++        {
++            if (!EsObjetoDePaso(objeto) || !EstaCerrado(objeto))
++                continue;
++
++            float mejor = 1.0e9f;
++            for (G3D::Vector3 const& p : puntos)
++            {
++                float d = Distancia(p.x, p.y, p.z, objeto->GetPositionX(), objeto->GetPositionY(), objeto->GetPositionZ());
++                if (d < mejor)
++                    mejor = d;
++            }
++
++            if (mejor > radio)
++                continue;
++
++            ++trabas;
++            if (trabas > 1)
++                cuales += ", ";
++            cuales += Trinity::StringFormat("{} a {:.0f} yd del camino", NombreObjeto(objeto, spawnId), mejor);
++        }
++
++        salida += Trinity::StringFormat("  jefe {} ({}): ruta OK con {} punto(s), {} traba(s){} {}\n",
++            entry, jefe->GetName(), uint32(puntos.size()), trabas,
++            trabas ? ":" : ".", trabas ? cuales : "");
++    }
++
++    return salida;
++}
++
++void Mgr::DevolverPiedra(Corrida const& corrida, uint32 nivel, bool subir)
++{
++    if (ConfigNumero("devolver_piedra", 1) == 0)
++    {
++        CharacterDatabase.PExecute("UPDATE mitica_corrida SET piedra_devuelta = 1 WHERE corrida_id = {}", corrida.Id);
++        return;
++    }
++
++    Estancia const* estancia = GetEstancia(corrida.CmId);
++    uint32 nivelDevuelto = nivel;
++    if (subir && estancia && nivelDevuelto < estancia->NivelMax)
++        ++nivelDevuelto;
++
++    // Si el lider no esta conectado la corrida queda con piedra_devuelta = 0: se le devuelve cuando
++    // entre al mundo (DevolverPiedrasPendientes). Asi un reinicio no se come la piedra.
++    Player* lider = ObjectAccessor::FindConnectedPlayer(corrida.Lider);
++    if (!lider)
++        return;
++
++    std::string motivo;
++    if (!DarPiedra(lider, corrida.CmId, nivelDevuelto, motivo))
++    {
++        TC_LOG_ERROR("scripts.miticas", "no se pudo devolver la piedra de la corrida {} ({})",
++            corrida.Id, motivo);
++        return;
++    }
++
++    CharacterDatabase.PExecute("UPDATE mitica_corrida SET piedra_devuelta = 1 WHERE corrida_id = {}", corrida.Id);
++
++    if (nivelDevuelto != nivel)
++        Aviso(lider, Plantilla("aviso_piedra_subida", corrida,
++            { { "nivel", Trinity::StringFormat("{}", nivelDevuelto) } }));
++}
++
++void Mgr::GuardarCorrida(Corrida const& corrida, char const* estado, char const* medalla, uint32 tiempoSeg)
++{
++    CharacterDatabase.PExecute(
++        "UPDATE mitica_corrida SET fin = NOW(), tiempo_seg = {}, muertes = {}, fuerzas = {}, "
++        "estado = '{}', medalla = '{}', puntos = {} WHERE corrida_id = {}",
++        tiempoSeg, corrida.Muertes, corrida.Fuerzas, estado, medalla, corrida.Puntos, corrida.Id);
++}
++
++void Mgr::MarcarCorridasViejas()
++{
++    // Al arrancar el mundo: lo que quedo "en curso" ya no existe (la instancia murio con el proceso).
++    // La piedra de esas corridas NO se pierde: quedan con piedra_devuelta = 0 y se les devuelve al
++    // entrar al mundo (DevolverPiedrasPendientes).
++    if (QueryResult resultado = CharacterDatabase.Query(
++            "SELECT COUNT(*) FROM mitica_corrida WHERE estado IN ('en_curso', 'prueba')"))
++    {
++        uint64 cuantas = resultado->Fetch()[0].GetUInt64();
++        if (cuantas)
++        {
++            CharacterDatabase.Execute("UPDATE mitica_corrida SET estado = 'interrumpida', fin = NOW() "
++                                      "WHERE estado IN ('en_curso', 'prueba')");
++            TC_LOG_INFO("scripts.miticas", "{} corrida(s) de mitica quedaron interrumpidas por el reinicio "
++                                           "(la piedra se devuelve al entrar al mundo)", cuantas);
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// La piedra angular: el ITEM manda, la tabla solo recuerda
++// ---------------------------------------------------------------------------
++// La regla que costo una prueba en vivo: si el sistema confia en sus propias anotaciones en vez del
++// inventario real, termina creyendo en piedras que ya no existen (fila huerfana que gana porque la
++// consulta no ordenaba) y le dice al jugador "la piedra no esta en tu inventario" teniendola en la
++// mano. Al re-crear un item el guid cambia, asi que una fila vieja nunca se "arregla" sola.
++void Mgr::AplicarPiedra(Item* piedra, uint32 cmId, uint32 nivel, std::string const& afijos) const
++{
++    if (!piedra)
++        return;
++
++    piedra->SetModifier(ITEM_MODIFIER_CHALLENGE_MAP_CHALLENGE_MODE_ID, cmId);
++    piedra->SetModifier(ITEM_MODIFIER_CHALLENGE_KEYSTONE_LEVEL, nivel);
++
++    uint32 tope = AfijosMax();
++    uint32 puestos = 0;
++    for (uint32 afijo : ListaDeIds(afijos))
++    {
++        if (puestos >= tope)
++            break;
++        piedra->SetModifier(ItemModifier(ITEM_MODIFIER_CHALLENGE_KEYSTONE_AFFIX_ID_1 + puestos), afijo);
++        ++puestos;
++    }
++}
++
++Item* Mgr::PiedraEnInventario(Player* jugador) const
++{
++    if (!jugador)
++        return nullptr;
++
++    uint32 entrada = ItemPiedra();
++    Item* encontrada = nullptr;
++    jugador->ForEachItem(ItemSearchLocation::Everywhere, [&encontrada, entrada](Item* item)
++    {
++        if (item->GetEntry() != entrada)
++            return ItemSearchCallbackResult::Continue;
++
++        encontrada = item;
++        return ItemSearchCallbackResult::Stop;
++    });
++    return encontrada;
++}
++
++bool Mgr::DarPiedra(Player* jugador, uint32 cmId, uint32 nivel, std::string& motivo)
++{
++    if (!jugador)
++    {
++        motivo = "no hay personaje";
++        return false;
++    }
++
++    Estancia const* estancia = GetEstancia(cmId);
++    if (!estancia)
++    {
++        motivo = "esa estancia no esta en la temporada (mira .mitica estancias)";
++        return false;
++    }
++    if (nivel < estancia->NivelMin || nivel > estancia->NivelMax)
++    {
++        motivo = Trinity::StringFormat("{} pide nivel de piedra entre {} y {}",
++            estancia->Nombre, estancia->NivelMin, estancia->NivelMax);
++        return false;
++    }
++
++    // Una sola piedra a la vez (el item tiene MaxCount = 1): la anterior se destruye Y se borra su
++    // fila. Antes la fila quedaba y despues se leia como si la piedra siguiera existiendo.
++    uint32 entrada = ItemPiedra();
++    jugador->DestroyItemCount(entrada, 10, true);
++    CharacterDatabase.PExecute("DELETE FROM mitica_piedra WHERE personaje = {}",
++        jugador->GetGUID().GetCounter());
++
++    Item* piedra = Item::CreateItem(entrada, 1, ItemContext::NONE, jugador);
++    if (!piedra)
++    {
++        motivo = "no se pudo crear la piedra";
++        return false;
++    }
++    AplicarPiedra(piedra, cmId, uint8(nivel), std::string());
++
++    ItemPosCountVec destino;
++    InventoryResult resultado = jugador->CanStoreItem(NULL_BAG, NULL_SLOT, destino, piedra, false);
++    if (resultado != EQUIP_ERR_OK)
++    {
++        delete piedra;
++        motivo = "no hay lugar en las bolsas";
++        return false;
++    }
++
++    piedra = jugador->StoreItem(destino, piedra, true);
++    if (!piedra)
++    {
++        motivo = "no se pudo guardar la piedra";
++        return false;
++    }
++
++    // El inventario manda: si el item no quedo de verdad en la mochila, NO se anota nada (una fila
++    // anotada sin item es una piedra fantasma).
++    if (!jugador->GetItemByGuid(piedra->GetGUID()))
++    {
++        motivo = "la piedra no entro a la mochila";
++        return false;
++    }
++
++    CharacterDatabase.PExecute(
++        "REPLACE INTO mitica_piedra (item_guid, personaje, cm_id, nivel, afijos) VALUES ({}, {}, {}, {}, '')",
++        piedra->GetGUID().GetCounter(), jugador->GetGUID().GetCounter(), cmId, nivel);
++
++    jugador->SendNewItem(piedra, 1, true, false);
++
++    TC_LOG_INFO("scripts.miticas", "piedra entregada a {}: {} nivel {} (item {})",
++        jugador->GetName(), estancia->Nombre, nivel, piedra->GetGUID().GetCounter());
++    motivo.clear();
++    return true;
++}
++
++uint32 Mgr::RecordarPiedras(Player* jugador)
++{
++    if (!jugador)
++        return 0;
++
++    QueryResult filas = CharacterDatabase.PQuery(
++        "SELECT item_guid, cm_id, nivel, afijos FROM mitica_piedra WHERE personaje = {} ORDER BY item_guid DESC",
++        jugador->GetGUID().GetCounter());
++    if (!filas)
++        return 0;
++
++    uint32 aplicadas = 0;
++    std::vector<uint64> huerfanas;
++
++    do
++    {
++        Field* campos = filas->Fetch();
++        ObjectGuid guidPiedra = ObjectGuid::Create<HighGuid::Item>(campos[0].GetUInt64());
++
++        Item* piedra = jugador->GetItemByGuid(guidPiedra);
++        if (!piedra)
++        {
++            huerfanas.push_back(campos[0].GetUInt64());
++            continue;
++        }
++
++        AplicarPiedra(piedra, campos[1].GetUInt32(), campos[2].GetUInt8(), campos[3].GetString());
++        ++aplicadas;
++    } while (filas->NextRow());
++
++    // Limpieza: la fila de una piedra que ya no existe se borra (al consumirla en una corrida, al
++    // destruirla, o al reemplazarla). Se hace despues de leer, no durante.
++    for (uint64 guidHuerfano : huerfanas)
++    {
++        CharacterDatabase.PExecute("DELETE FROM mitica_piedra WHERE item_guid = {}", guidHuerfano);
++        TC_LOG_INFO("scripts.miticas", "piedra fantasma borrada: la fila {} de {} apuntaba a un item que ya no existe",
++            guidHuerfano, jugador->GetName());
++    }
++
++    return aplicadas;
++}
++
++void Mgr::DevolverPiedrasPendientes(Player* jugador)
++{
++    if (!jugador || ConfigNumero("devolver_piedra", 1) == 0)
++        return;
++
++    QueryResult pendientes = CharacterDatabase.PQuery(
++        "SELECT corrida_id, cm_id, nivel, medalla FROM mitica_corrida "
++        "WHERE lider = {} AND piedra_devuelta = 0 AND estado <> 'en_curso' ORDER BY corrida_id",
++        jugador->GetGUID().GetCounter());
++    if (!pendientes)
++        return;
++
++    std::vector<std::tuple<uint64, uint32, uint32, std::string>> lista;
++    do
++    {
++        Field* campos = pendientes->Fetch();
++        lista.emplace_back(campos[0].GetUInt64(), campos[1].GetUInt32(), campos[2].GetUInt32(),
++            campos[3].GetString());
++    } while (pendientes->NextRow());
++
++    for (auto const& [corridaId, cmId, nivel, medalla] : lista)
++    {
++        Estancia const* estancia = GetEstancia(cmId);
++        uint32 nivelDevuelto = nivel;
++        if (medalla == "oro" && ConfigNumero("piedra_sube_con_oro", 1) != 0 && estancia && nivelDevuelto < estancia->NivelMax)
++            ++nivelDevuelto;
++
++        std::string motivo;
++        if (!DarPiedra(jugador, cmId, nivelDevuelto, motivo))
++        {
++            TC_LOG_ERROR("scripts.miticas", "no se pudo devolver la piedra de la corrida {} a {}: {}",
++                corridaId, jugador->GetName(), motivo);
++            continue;
++        }
++
++        CharacterDatabase.PExecute("UPDATE mitica_corrida SET piedra_devuelta = 1 WHERE corrida_id = {}", corridaId);
++        TC_LOG_INFO("scripts.miticas", "piedra devuelta a {} por la corrida {} ({} nivel {})",
++            jugador->GetName(), corridaId, estancia ? estancia->Nombre : "?", nivelDevuelto);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Hablar con el cliente
++// ---------------------------------------------------------------------------
++void Mgr::Aviso(Player* jugador, std::string const& texto) const
++{
++    if (jugador && jugador->GetSession())
++        jugador->GetSession()->SendNotification("%s", texto.c_str());
++}
++
++void Mgr::AvisarAlGrupo(Corrida const& corrida, std::string const& texto) const
++{
++    for (ObjectGuid const& guid : corrida.Miembros)
++        if (Player* miembro = ObjectAccessor::FindConnectedPlayer(guid))
++            Aviso(miembro, texto);
++}
++
++std::string Mgr::ResolverValor(std::string const& valor, Corrida const& corrida, Map const* mapa) const
++{
++    if (valor.size() < 4 || valor[0] != '{')
++        return valor;   // literal
++
++    Estancia const* estancia = GetEstancia(corrida.CmId);
++    Nivel const* nivel = GetNivel(corrida.NivelKeystone);
++    std::string clave = valor.substr(2, valor.size() - 4);
++
++    if (clave == "cm_id")        return Trinity::StringFormat("{}", corrida.CmId);
++    if (clave == "map_id")       return Trinity::StringFormat("{}", corrida.MapId);
++    if (clave == "nivel")        return Trinity::StringFormat("{}", corrida.NivelKeystone);
++    if (clave == "instancia")    return Trinity::StringFormat("{}", corrida.Instancia);
++    if (clave == "temporada")    return Trinity::StringFormat("{}", estancia ? estancia->Temporada : 1);
++    if (clave == "t_seg_oro")    return Trinity::StringFormat("{}", estancia ? estancia->TiempoOro : 0);
++    if (clave == "t_seg_plata")  return Trinity::StringFormat("{}", estancia ? estancia->TiempoPlata : 0);
++    if (clave == "t_seg_bronce") return Trinity::StringFormat("{}", estancia ? estancia->TiempoBronce : 0);
++    if (clave == "t_ms_bronce")  return Trinity::StringFormat("{}", estancia ? estancia->TiempoBronce * 1000 : 0);
++    if (clave == "ilvl_max")     return Trinity::StringFormat("{}", nivel ? nivel->IlvlMax : 0);
++    if (clave == "muertes")      return Trinity::StringFormat("{}", corrida.Muertes);
++    if (clave == "segundos")     return Trinity::StringFormat("{}", corrida.SegundosTranscurridos());
++    // El paquete de cierre pide la duracion en MILISEGUNDOS (el motor solo guarda segundos).
++    if (clave == "segundos_ms")  return Trinity::StringFormat("{}", uint64(corrida.SegundosTranscurridos()) * 1000);
++    if (clave == "puntos")       return Trinity::StringFormat("{}", corrida.Puntos);
++    if (clave == "grupo")        return Trinity::StringFormat("{}", uint32(corrida.Miembros.size()));
++    if (clave == "mapa_dificultad")
++        return Trinity::StringFormat("{}", mapa ? uint32(mapa->GetDifficultyID()) : 0);
++    if (clave == "afijos")
++    {
++        // IDs separados por espacio (formato para array_u32)
++        std::string ids;
++        for (uint32 afijo : ListaDeIds(corrida.Afijos))
++            ids += Trinity::StringFormat("{} ", afijo);
++        return ids;
++    }
++    return valor;
++}
++
++void Mgr::EnviarPaquete(Player* jugador, Corrida const& corrida, std::string const& nombre)
++{
++    if (!jugador)
++        return;
++
++    QueryResult cabecera = WorldDatabase.PQuery("SELECT activo FROM mitica_paquete WHERE opcode = '{}'", nombre);
++    if (!cabecera || cabecera->Fetch()[0].GetUInt8() == 0)
++        return;   // apagado en la base: no se manda
++
++    QueryResult campos = WorldDatabase.PQuery(
++        "SELECT tipo, valor FROM mitica_paquete_campo WHERE opcode = '{}' ORDER BY orden", nombre);
++    if (!campos)
++        return;
++
++    OpcodeServer opcode;
++    if (!OpcodeDeNombre(nombre, opcode))
++    {
++        TC_LOG_ERROR("scripts.miticas", "paquete desconocido en la base: {}", nombre);
++        return;
++    }
++
++    WorldPacket paquete(opcode);
++    std::vector<uint8> control;
++
++    do
++    {
++        Field* campo = campos->Fetch();
++        std::string tipo = campo[0].GetString();
++        std::string valor = ResolverValor(campo[1].GetString(), corrida, jugador->GetMap());
++
++        if (tipo == "u8")
++        {
++            uint8 v = uint8(strtoul(valor.c_str(), nullptr, 10));
++            paquete << v;
++            control.push_back(v);
++        }
++        else if (tipo == "u16")
++            paquete << uint16(strtoul(valor.c_str(), nullptr, 10));
++        else if (tipo == "u32")
++            paquete << uint32(strtoul(valor.c_str(), nullptr, 10));
++        else if (tipo == "i32")
++            paquete << int32(strtol(valor.c_str(), nullptr, 10));
++        else if (tipo == "u64")
++            paquete << uint64(strtoull(valor.c_str(), nullptr, 10));
++        else if (tipo == "f32")
++            paquete << float(strtof(valor.c_str(), nullptr));
++        else if (tipo == "cadena")
++            paquete << valor;
++        else if (tipo == "array_u32")
++        {
++            std::vector<uint32> ids = ListaDeIds(valor);
++            paquete << uint32(ids.size());
++            for (uint32 id : ids)
++                paquete << id;
++        }
++        else
++            TC_LOG_ERROR("scripts.miticas", "tipo de campo desconocido '{}' en {}", tipo, nombre);
++    } while (campos->NextRow());
++
++    jugador->SendDirectMessage(&paquete);
++    TC_LOG_INFO("scripts.miticas", "paquete {} ({} bytes) enviado a {} [{}]",
++        nombre, uint32(paquete.size()), jugador->GetName(), AHex(control));
++}
++} // namespace MythicPlus
++} // namespace Trinity
+diff --git a/src/server/game/MythicPlus/MythicPlusMgr.h b/src/server/game/MythicPlus/MythicPlusMgr.h
+new file mode 100644
+index 0000000000..a9d46d8436
+--- /dev/null
++++ b/src/server/game/MythicPlus/MythicPlusMgr.h
+@@ -0,0 +1,312 @@
++/*
++ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * ============================================================================
++ *  MythicPlusMgr - el sistema de miticas+ propio (estado y reglas)
++ * ============================================================================
++ *
++ *  Que hace: mantiene la corrida (que estancia, que nivel, quien, desde cuando, cuantas muertes,
++ *  cuanta fuerza llevan), lee las reglas de la base (world.mitica_*) y habla con el cliente.
++ *
++ *  Principio de diseno: TODO lo configurable sale de la base. Las tablas mitica_* mandan; este
++ *  codigo solo las interpreta. Agregar una estancia no se compila: se inserta.
++ *
++ *  Los paquetes al cliente se arman desde `mitica_paquete` + `mitica_paquete_campo`, para poder
++ *  reconstruir el formato de SMSG_CHALLENGE_MODE_* iterando con SQL en vez de recompilando.
++ * ============================================================================
++ */
++
++#ifndef MythicPlusMgr_h__
++#define MythicPlusMgr_h__
++
++#include "Define.h"
++#include "ObjectGuid.h"
++
++#include <ctime>
++#include <initializer_list>
++#include <string>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++class Creature;
++class Item;
++class Map;
++class Player;
++
++namespace Trinity
++{
++namespace MythicPlus
++{
++// Una estancia habilitada (world.mitica_estancia)
++struct Estancia
++{
++    uint32 CmId = 0;
++    uint32 MapId = 0;
++    std::string Nombre;
++    uint32 Temporada = 1;
++    bool Activa = true;
++    uint32 NivelMin = 2;
++    uint32 NivelRec = 5;
++    uint32 NivelMax = 10;
++    uint32 TiempoOro = 0;
++    uint32 TiempoPlata = 0;
++    uint32 TiempoBronce = 0;
++    uint32 FuerzasMin = 100;
++    uint32 CofreGo = 252064;
++    uint32 IlvlTecho = 318;
++    // Entries del jefe que cierra la corrida, separados por espacio (un encuentro puede ser de varios:
++    // Kyrakka y Erkhart, "La Oscuridad"...). Vacio = regla general: la corrida cierra cuando no queda
++    // ningun jefe marcado vivo (que en la TDB actual no sirve: no hay ninguno marcado).
++    std::string JefeFinal;
++
++    // Camino central (como retail): cuando no queda vivo ninguno de estos jefes, se abre el objeto de
++    // paso `CaminoGo` -- la escalera/reja que da al jefe final. Abrirlo dispara la animacion propia del
++    // objeto, que es la "cinematica" del pasillo. El vigilante automatico no lo toca: ese paso lo abre
++    // el diseño, y `.mitica destrabar` (manual) queda como ultima salida si algo falla.
++    std::string CaminoJefes;
++    uint32 CaminoGo = 0;
++
++    // Objetos de COLISION que hay que despenzar cuando se abre el camino (paredes invisibles
++    // genericas, tipo 5, que el destrabar no toca porque no son puertas). Separados por espacio.
++    std::string CaminoQuitar;
++
++    // NPC de salida: aparece junto al grupo al cerrar la corrida y, por gossip, los saca de la
++    // estancia (`SalidaPunto` = "mapa x y z o", tomado del trigger de salida del propio cliente).
++    uint32 SalidaNpc = 0;
++    std::string SalidaPunto;
++
++    // Botin del cofre de recompensa de esta estancia (tabla `mitica_cofre_item`). Sale del diario del
++    // cliente (`JournalEncounterItem`): es lo que el jefe suelta en retail.
++    std::vector<uint32> CofreItems;
++};
++
++// Un afijo de la temporada. `Implementacion` dice como se aplica (hoy solo `estatico` = multiplicador de
++// vida/dano) y `Parametros` lleva los numeros, con la forma "objetivo=jefes|basura;vida=N;dano=N".
++// Todo dato: se ajusta en `world.mitica_afijo` sin recompilar.
++struct Afijo
++{
++    uint32 Id = 0;
++    std::string Nombre;
++    std::string Implementacion;
++    std::string Parametros;
++    bool Activo = false;
++};
++
++// La curva de dificultad (world.mitica_nivel)
++struct Nivel
++{
++    uint32 NivelPiedra = 2;   // (no se llama "Nivel": el miembro no puede repetir el nombre del struct)
++    float VidaPct = 100.0f;
++    float DanoPct = 100.0f;
++    float JefeVidaPct = 100.0f;
++    float JefeDanoPct = 100.0f;
++    uint32 FuerzasObjetivo = 100;
++    uint32 IlvlMin = 0;
++    uint32 IlvlMax = 0;
++};
++
++// Una corrida viva (o cerrada si Estado != en_curso)
++struct Corrida
++{
++    uint64 Id = 0;
++    uint32 CmId = 0;
++    uint32 MapId = 0;
++    uint32 NivelKeystone = 2;
++    std::string Afijos;
++    uint32 Instancia = 0;
++    ObjectGuid Lider;
++    std::vector<ObjectGuid> Miembros;
++    time_t Inicio = 0;
++    uint32 Muertes = 0;
++    float Fuerzas = 0.0f;
++    bool Prueba = false;
++
++    // Estado de la vigilancia (si no, una corrida de prueba con jefes ya muertos cerraria sola)
++    bool JefesVistos = false;        // se vio al menos un jefe vivo en la instancia
++    bool AvisoFuerzas = false;       // ya se aviso que las fuerzas estan completas
++
++    // Camino central: el paso al jefe final se abre cuando mueren los jefes declarados en la estancia.
++    bool CaminoVistos = false;       // se vio vivo al menos uno de esos jefes (una instancia recien cargada no cuenta)
++    bool CaminoAbierto = false;      // ya se abrio (o ya estaba abierto): no se repite
++
++    // Red de seguridad del recorrido: si el lider se queda parado al lado de un objeto de paso
++    // cerrado (una reja comun que nadie abre), el vigilante la abre. No es adorno: es lo que hace
++    // que una corrida no se trabe nunca por un dato que falte.
++    float UltimaX = 0.0f;
++    float UltimaY = 0.0f;
++    float UltimaZ = 0.0f;
++    bool PosicionInicial = false;    // todavia no se guardo la posicion del lider
++    uint32 QuietoSeg = 0;            // segundos acumulados sin moverse (casi)
++    uint32 TrabasAbiertas = 0;       // cuantos objetos abrio el vigilante en esta corrida
++
++    // La corrida ya cerro (piedra devuelta, cofre y guia invocados). Se conserva en memoria un rato
++    // para que el cofre y el guia sigan funcionando: el cierre NO borra el estado.
++    bool Cerrada = false;
++    std::vector<ObjectGuid> CofreLooteado;   // quien ya saco su item del cofre (una vez por cabeza)
++
++    // Puntaje de la corrida (formula NUESTRA, ver `CalcularPuntos`): se guarda en la corrida para que
++    // viaje en el paquete de cierre y en el aviso del chat.
++    uint32 Puntos = 0;
++
++    uint32 SegundosTranscurridos() const
++    {
++        return Inicio ? uint32(time(nullptr) - Inicio) : 0;
++    }
++};
++
++class Mgr
++{
++public:
++    static Mgr* instance();
++
++    // --- configuracion (world.mitica_*) ---
++    void CargarConfig();
++    Estancia const* GetEstancia(uint32 cmId) const;
++    Nivel const* GetNivel(uint32 nivelKeystone) const;
++    std::vector<Estancia> const& GetEstancias() const { return _estancias; }
++
++    // --- configuracion dinamica: numeros y textos de world.mitica_config (nada quemado) ---
++    std::string Config(std::string const& clave, std::string const& porDefecto = "") const;
++    uint32 ConfigNumero(std::string const& clave, uint32 porDefecto) const;
++    uint32 ItemPiedra() const;          // item de la piedra angular
++    uint32 AfijosMax() const;           // cuantos afijos puede llevar la piedra
++    std::string TemporadaNombre() const;
++
++    // Arma un texto desde una plantilla de mitica_config; resuelve {estancia} {nivel} {oro} {plata}
++    // {bronce} {muertes} {fuerzas} {tiempo} {medalla} y los extras que se pasen.
++    std::string Plantilla(std::string const& clave, Corrida const& corrida,
++        std::initializer_list<std::pair<std::string, std::string>> extras = {}) const;
++
++    // --- ciclo de vida de la corrida ---
++    // `piedra` es el item real del inventario del lider: la mitica+ consume la piedra al arrancar
++    // (como en retail) y la devuelve al cerrar. La tabla characters.mitica_piedra solo recuerda
++    // que modificadores lleva el item, NO es la fuente de verdad de que el item exista.
++    bool Iniciar(Player* lider, Item* piedra, uint32 cmId, uint32 nivelKeystone, bool prueba,
++        std::string& motivo);
++    Corrida* GetCorridaDe(Player const* jugador);
++    Corrida* GetCorridaPorInstancia(uint32 mapId, uint32 instancia);
++    void AgregarMuerte(Player* jugador);
++    void AgregarFuerzas(Player* jugador, float pct);
++    // Cierra la corrida (medalla, aviso, paquete) y devuelve la piedra a quien la puso.
++    bool Cerrar(Corrida& corrida, bool fueraDeTiempo, std::string& motivo);
++
++    // Vigilancia periodica: cierra la corrida cuando ya no queda ningun jefe vivo en la
++    // instancia. NO depende del gancho del asesino, asi que tambien cuenta la muerte por
++    // comando de GM (`.die`), por trampa del entorno o por un tercero.
++    void Vigilar();
++
++    // --- red de seguridad del recorrido (que una reja sin logica no trabe la corrida) ---
++    // Cuenta los objetos de paso CERRADOS de la instancia (puertas y muros destructibles).
++    uint32 ContarTrabas(Map* mapa, std::string& detalle) const;
++    // Abre esos objetos. Devuelve cuantos abrio y deja sus nombres en `detalle`.
++    uint32 Destrabar(Map* mapa, std::string& detalle) const;
++    // Vigilante: si el lider lleva rato parado al lado de una puerta cerrada, la abre (queda en el
++    // log). Devuelve cuantos objetos abrio en esta vuelta.
++    uint32 VigilarRecorrido(Corrida& corrida, Map* mapa);
++    // Diagnostico de recorrido: para cada jefe declarado, calcula el camino con los mmaps y dice
++    // que objetos cerrados caen encima. `desde` es el punto de partida (el jugador o la entrada).
++    std::string DiagnosticoRecorrido(Map* mapa, Estancia const* estancia,
++        float desdeX, float desdeY, float desdeZ) const;
++
++    // --- camino central (como retail: el paso al jefe final se abre con los jefes de antes) ---
++    // Cuenta cuantas criaturas VIVAS de la lista siguen en la instancia.
++    uint32 JefesVivosDeLista(Map* mapa, std::vector<uint32> const& entries) const;
++
++    // Puntaje de una corrida segun nuestras constantes de `mitica_config`.
++    uint32 CalcularPuntos(Corrida const& corrida, std::string const& medalla) const;
++    // Despenza los gameobjects de la lista (paredes de colision del paso). Devuelve cuantos saco
++    // y deja los nombres en `detalle`. Se usa al abrir el camino central y en el destrabar manual.
++    uint32 QuitarParedes(Map* mapa, std::vector<uint32> const& spawnIds, std::string& detalle) const;
++    // Abre el paso al jefe final cuando ya no queda vivo ninguno de los jefes de `camino_jefes`.
++    // Devuelve true solo la vez que lo abre.
++    bool AbrirCaminoCentral(Corrida& corrida, Map* mapa);
++
++    // Punto de salida de la estancia de ese mapa ("mapa x y z o"). Lo usa el NPC de salida para
++    // sacar al grupo cuando lo piden por gossip. Devuelve false si esa estancia no lo tiene.
++    bool PuntoDeSalida(uint32 mapId, uint32& mapaDestino, float& x, float& y, float& z, float& o) const;
++
++    // El cofre de recompensa: lo llama la IA del gameobject cuando un jugador le hace clic. Entrega
++    // UN item del botin de la estancia, escalado con el nivel de la piedra de esa corrida, una sola
++    // vez por jugador. Devuelve true si entrego algo (o si ya lo tenia).
++    bool AbrirCofre(Player* jugador);
++    // El mapa cargado de la estancia (la instancia que este viva ahora), o nullptr.
++    Map* MapaDeEstancia(uint32 cmId) const;
++
++    // --- la piedra angular (los modificadores que el core no persiste) ---
++    // Deja el item con los modificadores 17..22 que el cliente necesita para saber que mazmorra
++    // y que nivel es.
++    void AplicarPiedra(Item* piedra, uint32 cmId, uint32 nivel, std::string const& afijos) const;
++    // La piedra REAL del inventario del personaje (no la tabla).
++    Item* PiedraEnInventario(Player* jugador) const;
++    // Entrega una piedra nueva (destruye la anterior: el item tiene MaxCount = 1) y la recuerda.
++    bool DarPiedra(Player* jugador, uint32 cmId, uint32 nivel, std::string& motivo);
++    // Al entrar al mundo: reaplica los modificadores de las piedras que existen y borra las filas
++    // huerfanas (piedras consumidas o destruidas). Devuelve cuantas piedras completo.
++    uint32 RecordarPiedras(Player* jugador);
++    // Al entrar al mundo: devuelve la piedra de las corridas que cerraron sin poder darsela
++    // (interrumpidas por un reinicio, o cerradas con el lider desconectado).
++    void DevolverPiedrasPendientes(Player* jugador);
++
++    // --- escalado y fuerzas (Fase 1) ---
++    // Aplica vida_pct/dano_pct del nivel a las criaturas que ya estan en la instancia.
++    void EscalarPorNivel(Map* mapa, Corrida const& corrida) const;
++    // Fuerzas que aporta una criatura al morir (tabla por criatura, con regla por clasificacion).
++    // `corrida` es la del asesino: sirve para saber quien es el jefe final declarado de la estancia.
++    float FuerzasDeCriatura(Creature* criatura, Corrida const* corrida) const;
++
++    // Al arrancar el mundo: las corridas que quedaron abiertas se cierran (nadie pierde la piedra).
++    void MarcarCorridasViejas();
++
++    // --- habla con el cliente ---
++    // Manda un paquete armado desde la base (mitica_paquete + mitica_paquete_campo).
++    void EnviarPaquete(Player* jugador, Corrida const& corrida, std::string const& opcode);
++    void Aviso(Player* jugador, std::string const& texto) const;
++
++    // Medalla segun los tiempos de la estancia (0 = ninguna).
++    std::string Medalla(Corrida const& corrida) const;
++
++private:
++    void GuardarCorrida(Corrida const& corrida, char const* estado, char const* medalla, uint32 tiempoSeg);
++    void AvisarAlGrupo(Corrida const& corrida, std::string const& texto) const;
++    std::string ResolverValor(std::string const& valor, Corrida const& corrida, Map const* mapa) const;
++
++    // Devuelve la piedra de la corrida al lider si esta conectado; si no, deja la corrida marcada
++    // para devolverla cuando entre (asi un reinicio no se come la piedra de nadie).
++    void DevolverPiedra(Corrida const& corrida, uint32 nivel, bool subir);
++    // Jefes de la instancia que siguen vivos (0 = la mazmorra esta terminada).
++    uint32 JefesVivos(Map* mapa, Estancia const* estancia) const;
++    // La criatura es parte del jefe final declarado por la estancia?
++    bool EsJefeFinal(Estancia const* estancia, uint32 entry) const;
++
++    std::unordered_map<std::string, std::string> _config;   // world.mitica_config
++    std::string _temporadaNombre = "Temporada";
++    std::vector<Estancia> _estancias;
++    std::unordered_map<uint32, Estancia> _porCmId;
++    std::unordered_map<uint32, Nivel> _niveles;
++    std::unordered_map<uint32, Afijo> _afijos;          // world.mitica_afijo (efecto de cada afijo)
++    std::unordered_map<uint64, Corrida> _corridas;      // por corrida_id
++    uint64 _siguienteId = 1;
++    bool _configCargada = false;
++};
++} // namespace MythicPlus
++} // namespace Trinity
++
++#define sMythicPlus Trinity::MythicPlus::Mgr::instance()
++
++#endif // MythicPlusMgr_h__
+diff --git a/src/server/game/Server/Packets/ChallengeModePackets.h b/src/server/game/Server/Packets/ChallengeModePackets.h
+new file mode 100644
+index 0000000000..730efcfbeb
+--- /dev/null
++++ b/src/server/game/Server/Packets/ChallengeModePackets.h
+@@ -0,0 +1,72 @@
++/*
++ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef ChallengeModePackets_h__
++#define ChallengeModePackets_h__
++
++#include "Packet.h"
++
++#include <vector>
++
++namespace WorldPackets
++{
++namespace ChallengeMode
++{
++// CMSG_START_CHALLENGE_MODE: el cliente lo manda cuando el lider inserta la piedra en el receptaculo.
++// El FORMATO esta medido a medias: los dos primeros bytes son la ubicacion de la piedra en las bolsas
++// (en vivo llego FF 24 = bolsa 255 = mochila, ranura 36) y los 13 bytes que siguen no estan
++// documentados. En vez de inventar campos se parsea lo que se sabe y el resto se guarda crudo, para
++// poder aprenderlo con datos.
++class StartChallengeMode final : public ClientPacket
++{
++public:
++    explicit StartChallengeMode(WorldPacket&& packet) : ClientPacket(CMSG_START_CHALLENGE_MODE, std::move(packet)) { }
++
++    void Read() override
++    {
++        _worldPacket >> Bolsa;
++        _worldPacket >> Ranura;
++
++        Crudo.reserve(_worldPacket.size() - _worldPacket.rpos());
++        while (_worldPacket.rpos() < _worldPacket.size())
++        {
++            uint8 byte = 0;
++            _worldPacket >> byte;
++            Crudo.push_back(byte);
++        }
++    }
++
++    uint8 Bolsa = 0;
++    uint8 Ranura = 0;
++    std::vector<uint8> Crudo;
++};
++
++// CMSG_REQUEST_MYTHIC_PLUS_SEASON_DATA: el cliente pide los datos de la temporada al abrir el panel
++// (y al entrar al mundo). El paquete viene VACIO - medido dos veces contra el servidor oficial
++// (19-sep y 21-sep 11:46:20, longitud 0) - y el oficial contesta SMSG_MYTHIC_PLUS_SEASON_DATA de UN
++// byte con `IsMythicPlusActive: True`. No hay nada que leer.
++class RequestMythicPlusSeasonData final : public ClientPacket
++{
++public:
++    explicit RequestMythicPlusSeasonData(WorldPacket&& packet) : ClientPacket(CMSG_REQUEST_MYTHIC_PLUS_SEASON_DATA, std::move(packet)) { }
++
++    void Read() override { }
++};
++} // namespace ChallengeMode
++} // namespace WorldPackets
++
++#endif // ChallengeModePackets_h__
+diff --git a/src/server/scripts/Custom/miticas_custom.cpp b/src/server/scripts/Custom/miticas_custom.cpp
+new file mode 100644
+index 0000000000..639f6f39d2
+--- /dev/null
++++ b/src/server/scripts/Custom/miticas_custom.cpp
+@@ -0,0 +1,622 @@
++/*
++ * ============================================================================
++ *  miticas_custom.cpp - Sistema de miticas+ propio: EL ENGANCHES DEL JUEGO
++ * ============================================================================
++ *
++ *  POR QUE EXISTE ESTE ARCHIVO
++ *  El core sabe crear el item 180653 (Piedra angular mitica) pero NO tiene forma
++ *  de decirle AL CLIENTE de que mazmorra es ni de que nivel. Ese dato viaja en
++ *  MODIFICADORES del item, que el servidor manda junto con el item
++ *  (ver ItemPacketsCommon.cpp:49, que los vuelca al paquete):
++ *
++ *      17 = ITEM_MODIFIER_CHALLENGE_MAP_CHALLENGE_MODE_ID    -> id de MapChallengeMode
++ *      18 = ITEM_MODIFIER_CHALLENGE_KEYSTONE_LEVEL           -> nivel de la piedra
++ *      19..22 = ITEM_MODIFIER_CHALLENGE_KEYSTONE_AFFIX_ID_1..4 (afijos)
++ *      (ItemDefines.h:242-248)
++ *
++ *  Verificado en vivo: con el item pelado (sin modificadores) el receptaculo del
++ *  calabozo contesta "es una piedra de otra mazmorra"; la lista de bonus del cliente
++ *  por si sola no alcanza.
++ *
++ *  QUE HACE ESTE ARCHIVO (las piezas de juego; el motor es MythicPlusMgr)
++ *   - Al ENTRAR al mundo: reaplica los modificadores a las piedras del inventario
++ *     (el core no los persiste), borra las filas que apuntan a items que ya no existen,
++ *     y devuelve la piedra de las corridas que cerraron sin poder darsela.
++ *   - Cada muerte del grupo suma al contador de la corrida; cada enemigo muerto aporta
++ *     fuerzas.
++ *   - La corrida se CIERRA por reloj de mundo (WorldScript::OnUpdate -> Mgr::Vigilar),
++ *     mirando si queda algun jefe vivo en la instancia. No depende del gancho del
++ *     asesino, asi que tambien cuenta la muerte por `.die`, por una trampa o por un
++ *     tercero.
++ *   - Los comandos de operacion: `.mitica piedra | estancias | estado | cerrar`.
++ * ============================================================================
++ */
++
++#include "Chat.h"
++#include "ChatCommand.h"
++#include "Cache/CharacterCache.h"
++#include "CreatureAI.h"
++#include "DatabaseEnv.h"
++#include "EscaladoEstanciaMgr.h"
++#include "GameObjectAI.h"
++#include "GossipDef.h"
++#include "Item.h"
++#include "ItemDefines.h"
++#include "Log.h"
++#include "Mail.h"
++#include "Map.h"
++#include "MythicPlusMgr.h"
++#include "Player.h"
++#include "RBAC.h"
++#include "ScriptMgr.h"
++#include "StringFormat.h"
++#include "Util.h"
++
++#include <vector>
++
++#include <span>
++#include <string>
++
++namespace
++{
++class script_piedras_miticas : public PlayerScript
++{
++public:
++    script_piedras_miticas() : PlayerScript("script_piedras_miticas") { }
++
++    void OnLogin(Player* jugador, bool /*primerIngreso*/) override
++    {
++        // Se reaplica lo que el core no persiste (los modificadores de la piedra) y se limpian las
++        // filas huerfanas: el inventario real manda sobre lo que el sistema anoto.
++        if (uint32 aplicadas = sMythicPlus->RecordarPiedras(jugador))
++            TC_LOG_INFO("scripts.miticas", "Piedra(s) de mitica aplicada(s) a {}: {}", jugador->GetName(), aplicadas);
++
++        sMythicPlus->DevolverPiedrasPendientes(jugador);
++    }
++
++    // Cada muerte del grupo suma al contador de la corrida (y se lo cuenta al cliente).
++    void OnPlayerKilledByCreature(Creature* /*killer*/, Player* muerto) override
++    {
++        sMythicPlus->AgregarMuerte(muerto);
++    }
++
++    // Cada enemigo que muere aporta sus fuerzas. El cierre NO se decide aca: se mira la instancia
++    // (Mgr::Vigilar), porque una muerte por comando de GM no se le atribuye a ningun jugador.
++    // Después de cada muerte se dispara la vigilancia para que el cierre sea inmediato.
++    void OnCreatureKill(Player* asesino, Creature* muerto) override
++    {
++        if (!asesino || !muerto)
++            return;
++
++        if (float pct = sMythicPlus->FuerzasDeCriatura(muerto, sMythicPlus->GetCorridaDe(asesino)))
++            sMythicPlus->AgregarFuerzas(asesino, pct);
++
++        sMythicPlus->Vigilar();
++    }
++};
++
++class script_miticas_mundo : public WorldScript
++{
++public:
++    script_miticas_mundo() : WorldScript("script_miticas_mundo") { }
++
++    void OnStartup() override
++    {
++        sMythicPlus->CargarConfig();
++        sMythicPlus->MarcarCorridasViejas();
++
++        // Fase 2 (estancias escalables): la perilla por estancia. Se carga aca, con el mundo ya
++        // inicializado y las migraciones de la base aplicadas. Sin filas, el sistema no hace nada.
++        sEscaladoInstancia->Cargar();
++    }
++
++    // El reloj de la vigilancia: cada `vigilancia_seg` segundos (mitica_config) se mira si la
++    // corrida ya no tiene jefes vivos. Es un reloj del mundo y no del evento de muerte justamente
++    // para no depender de quien mato al jefe.
++    void OnUpdate(uint32 diff) override
++    {
++        _acumulado += diff;
++
++        uint32 cada = sMythicPlus->ConfigNumero("vigilancia_seg", 5);
++        if (!cada)
++            cada = 5;
++        if (_acumulado < cada * IN_MILLISECONDS)
++            return;
++
++        _acumulado = 0;
++        sMythicPlus->Vigilar();
++    }
++
++private:
++    uint32 _acumulado = 0;
++};
++
++// --- entrega de items por correo con el CONTEXTO correcto -------------------------
++// El nivel de objeto que ve el cliente NO es el del DB2 (ItemSparse.ItemLevel: el botin
++// del Abismo Venenoso tiene 219 de base), sino ese mas los bonus de la dificultad: la
++// guia de aventura muestra 302 en normal. Esos bonus los aplica el core a partir del
++// ItemContext, y `.send items` crea los items con ItemContext::NONE -> salen a 219.
++// Aca se usa Item::CreateItem(id, cantidad, contexto) con addDefaultBonuses = true, que
++// es EL MISMO camino que usa el botin (Player::StoreNewItem), asi que el nivel lo
++// calcula el servidor y el cliente lo dibuja igual que si hubiera caido en la raid.
++static Optional<ItemContext> ContextoPorNombre(std::string const& nombre)
++{
++    if (nombre == "NONE")                  return ItemContext::NONE;
++    if (nombre == "Dungeon_Normal")        return ItemContext::Dungeon_Normal;
++    if (nombre == "Dungeon_Heroic")        return ItemContext::Dungeon_Heroic;
++    if (nombre == "Dungeon_Mythic")        return ItemContext::Dungeon_Mythic;
++    if (nombre == "Raid_Normal")           return ItemContext::Raid_Normal;
++    if (nombre == "Raid_Raid_Finder")      return ItemContext::Raid_Raid_Finder;
++    if (nombre == "Raid_Heroic")           return ItemContext::Raid_Heroic;
++    if (nombre == "Raid_Mythic")           return ItemContext::Raid_Mythic;
++    if (nombre == "Quest_Reward")          return ItemContext::Quest_Reward;
++    if (nombre == "Vendor")                return ItemContext::Vendor;
++    if (nombre == "Timewalking")           return ItemContext::Timewalking;
++    if (nombre == "MythicPlus_End_of_Run") return ItemContext::MythicPlus_End_of_Run;
++    return {};
++}
++
++// --- comandos de operacion: un comando por tarea ---------------------------------
++using namespace Trinity::ChatCommands;
++
++class comando_mitica : public CommandScript
++{
++public:
++    comando_mitica() : CommandScript("comando_mitica") { }
++
++    std::span<ChatCommandBuilder const> GetCommands() const override
++    {
++        static ChatCommandTable miticaCommandTable =
++        {
++            { "piedra",    HandlePiedraCommand,    rbac::RBAC_PERM_COMMAND_ADDITEM, Console::No },
++            { "estancias", HandleEstanciasCommand, rbac::RBAC_PERM_COMMAND_ADDITEM, Console::No },
++            { "estado",    HandleEstadoCommand,    rbac::RBAC_PERM_COMMAND_ADDITEM, Console::No },
++            { "cerrar",    HandleCerrarCommand,    rbac::RBAC_PERM_COMMAND_ADDITEM, Console::No },
++            // Red de seguridad del recorrido: los dos andan tambien por consola (Console::Yes), asi
++            // que el agente puede medir y destrabar sin tener el cliente abierto.
++            { "destrabar", HandleDestrabarCommand, rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++            { "trabas",    HandleTrabasCommand,    rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++            // Entrega por correo con el contexto de dificultad (el nivel de objeto real). Anda por
++            // consola, asi que el agente manda el obsequio sin tener el cliente abierto.
++            { "obsequio",  HandleObsequioCommand,  rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++            // Escalado por estancia (Fase 2): la perilla de `instancia_escalado`. Anda por consola
++            // porque el agente tiene que poder verificar sin el cliente abierto, y se recarga en
++            // caliente porque ajustar una banda no deberia costar un reinicio del mundo.
++            { "escalado",  HandleEscaladoCommand,  rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++        };
++        static ChatCommandTable commandTable =
++        {
++            { "mitica", miticaCommandTable },
++        };
++        return commandTable;
++    }
++
++    static bool HandlePiedraCommand(ChatHandler* handler, Optional<uint32> cmId, Optional<uint32> nivel)
++    {
++        Player* jugador = handler->GetPlayer();
++        if (!jugador)
++        {
++            handler->SendSysMessage("Este comando necesita un personaje en el mundo.");
++            return false;
++        }
++
++        uint32 elegida = cmId.value_or(0);
++        if (!elegida)
++        {
++            auto const& estancias = sMythicPlus->GetEstancias();
++            if (estancias.empty())
++            {
++                handler->SendSysMessage("No hay estancias cargadas: revisa world.mitica_estancia.");
++                return false;
++            }
++            elegida = estancias[urand(0, uint32(estancias.size()) - 1)].CmId;
++        }
++
++        uint32 pedido = nivel.value_or(0) ? *nivel : 2;
++        std::string motivo;
++        if (!sMythicPlus->DarPiedra(jugador, elegida, pedido, motivo))
++        {
++            handler->SendSysMessage(motivo.c_str());
++            return false;
++        }
++
++        handler->PSendSysMessage("Piedra entregada (estancia %u, nivel %u). Anda al receptaculo de esa mazmorra.",
++            elegida, pedido);
++        return true;
++    }
++
++    static bool HandleEstanciasCommand(ChatHandler* handler)
++    {
++        auto const& estancias = sMythicPlus->GetEstancias();
++        handler->PSendSysMessage("Miticas+ | temporada activa: %s | %u estancias",
++            sMythicPlus->TemporadaNombre().c_str(), uint32(estancias.size()));
++        for (Trinity::MythicPlus::Estancia const& e : estancias)
++            handler->PSendSysMessage("  cm %u | mapa %u | %s | nivel %u-%u | oro %u min | jefe final %s | %s",
++                e.CmId, e.MapId, e.Nombre.c_str(), e.NivelMin, e.NivelMax,
++                e.TiempoOro / 60, e.JefeFinal.empty() ? "cualquiera" : e.JefeFinal.c_str(),
++                e.Activa ? "activa" : "APAGADA");
++        return true;
++    }
++
++    // Escalado por estancia (Fase 2). `.mitica escalado` muestra la perilla cargada; con `recargar`
++    // vuelve a leer `world.instancia_escalado` sin reiniciar el mundo (ajustar una banda o un modo es
++    // un UPDATE, y ahora no cuesta nada verlo).
++    static bool HandleEscaladoCommand(ChatHandler* handler, char const* args)
++    {
++        std::string accion = args ? args : "";
++        while (!accion.empty() && accion.front() == ' ')
++            accion.erase(accion.begin());
++
++        if (accion == "recargar")
++        {
++            sEscaladoInstancia->Cargar();
++            handler->SendSysMessage(Trinity::StringFormat(
++                "escalado por estancia recargado: {} regla(s).", sEscaladoInstancia->GetReglas()));
++            return true;
++        }
++
++        // OJO: PSendSysMessage es estilo printf (%u), no de llaves: con {} imprime el {} literal.
++        // Para el estilo del proyecto se arma el texto con StringFormat y se manda como cadena.
++        handler->SendSysMessage(Trinity::StringFormat(
++            "escalado por estancia: {} regla(s) cargada(s). Reglas que hacen algo:",
++            sEscaladoInstancia->GetReglas()));
++
++        std::vector<std::string> lineas = sEscaladoInstancia->DescribirReglas();
++        if (lineas.empty())
++            handler->SendSysMessage("   (ninguna: todo queda como lo declara el cliente)");
++        for (std::string const& linea : lineas)
++            handler->SendSysMessage(linea);
++
++        handler->SendSysMessage("uso: .mitica escalado recargar   (relee world.instancia_escalado)");
++        return true;
++    }
++
++    static bool HandleEstadoCommand(ChatHandler* handler)
++    {
++        Player* jugador = handler->GetPlayer();
++        if (!jugador)
++            return false;
++
++        Trinity::MythicPlus::Corrida* corrida = sMythicPlus->GetCorridaDe(jugador);
++        if (!corrida)
++        {
++            handler->SendSysMessage("No hay una corrida de mitica+ en curso para tu personaje.");
++            return true;
++        }
++
++        Trinity::MythicPlus::Estancia const* estancia = sMythicPlus->GetEstancia(corrida->CmId);
++        handler->PSendSysMessage("Corrida %llu | %s | nivel %u | %u s | %u muertes | %.1f%% fuerzas%s",
++            corrida->Id, estancia ? estancia->Nombre.c_str() : "?", corrida->NivelKeystone,
++            corrida->SegundosTranscurridos(), corrida->Muertes, corrida->Fuerzas,
++            corrida->Prueba ? " [PRUEBA]" : "");
++        return true;
++    }
++
++    // Cierra la corrida de la instancia en la que esta el personaje. Existe porque una prueba puede
++    // quedar con los jefes ya muertos antes de arrancar (la vigilancia no cierra lo que nunca vio).
++    static bool HandleCerrarCommand(ChatHandler* handler)
++    {
++        Player* jugador = handler->GetPlayer();
++        if (!jugador || !jugador->GetMap())
++        {
++            handler->SendSysMessage("Este comando necesita un personaje en el mundo.");
++            return false;
++        }
++
++        Trinity::MythicPlus::Corrida* corrida = sMythicPlus->GetCorridaPorInstancia(
++            jugador->GetMap()->GetId(), jugador->GetMap()->GetInstanceId());
++        if (!corrida)
++        {
++            handler->SendSysMessage("No hay una corrida de mitica+ en esta instancia.");
++            return false;
++        }
++
++        std::string motivo;
++        if (!sMythicPlus->Cerrar(*corrida, false, motivo))
++        {
++            handler->PSendSysMessage("No se pudo cerrar la corrida: %s", motivo.c_str());
++            return false;
++        }
++
++        handler->SendSysMessage("Corrida cerrada. La piedra vuelve a tu inventario.");
++        return true;
++    }
++
++    // === Red de seguridad del recorrido ===================================================
++    // Abre los objetos de paso CERRADOS de la instancia (puertas y muros destructibles). Es el
++    // boton de panico: si el dato o el guion fallaran y una reja queda trabada, esto la abre.
++    // Funciona tambien por consola: sin jugador resuelve la instancia con el cm de la estancia.
++    static bool HandleDestrabarCommand(ChatHandler* handler, Optional<uint32> cmId)
++    {
++        Map* mapa = nullptr;
++        if (Player* jugador = handler->GetPlayer())
++            mapa = jugador->GetMap();
++        else if (cmId)
++            mapa = sMythicPlus->MapaDeEstancia(*cmId);
++
++        if (!mapa)
++        {
++            handler->SendSysMessage("Necesito estar dentro de la instancia, o pasar el cm de una estancia con corrida en curso.");
++            TC_LOG_INFO("scripts.miticas", "recorrido (destrabar): no hay instancia cargada para el cm {}", cmId ? *cmId : 0);
++            return false;
++        }
++
++        std::string detalle;
++        uint32 abiertos = sMythicPlus->Destrabar(mapa, detalle);
++        if (!abiertos)
++        {
++            handler->SendSysMessage("No habia ningun objeto de paso cerrado en la instancia.");
++            TC_LOG_INFO("scripts.miticas", "recorrido (destrabar): no habia objetos de paso cerrados en el mapa {}", mapa->GetId());
++            return true;
++        }
++
++        // Por consola (SOAP) el texto de `SendSysMessage` no siempre vuelve; el log si.
++        handler->PSendSysMessage("Destrabados %u objeto(s): %s", abiertos, detalle.c_str());
++        TC_LOG_INFO("scripts.miticas", "recorrido (destrabar): {} objeto(s) abiertos en el mapa {}: {}",
++            abiertos, mapa->GetId(), detalle);
++        return true;
++    }
++
++    // Diagnostico de recorrido: para cada jefe declarado, calcula el camino con los mmaps y dice
++    // que objetos CERRADOS caen encima. Es la medicion de "esto no se puede trabar": si una reja
++    // sin logica esta sobre el camino, aca sale con su nombre.
++    static bool HandleTrabasCommand(ChatHandler* handler, Optional<uint32> cmId)
++    {
++        Map* mapa = nullptr;
++        Trinity::MythicPlus::Estancia const* estancia = nullptr;
++        float x = 0.0f, y = 0.0f, z = 0.0f;
++
++        if (Player* jugador = handler->GetPlayer())
++        {
++            mapa = jugador->GetMap();
++            x = jugador->GetPositionX();
++            y = jugador->GetPositionY();
++            z = jugador->GetPositionZ();
++
++            if (Trinity::MythicPlus::Corrida* corrida = sMythicPlus->GetCorridaDe(jugador))
++                estancia = sMythicPlus->GetEstancia(corrida->CmId);
++        }
++
++        if (!mapa && cmId)
++        {
++            mapa = sMythicPlus->MapaDeEstancia(*cmId);
++            estancia = sMythicPlus->GetEstancia(*cmId);
++
++            // Sin jugador no hay posicion: se arranca desde la ENTRADA del calabozo (el punto
++            // seguro que la base ya tiene para esa mazmorra).
++            if (mapa)
++            {
++                if (QueryResult punto = WorldDatabase.Query(
++                    Trinity::StringFormat(
++                        "SELECT LocX, LocY, LocZ FROM world_safe_locs WHERE MapID = {} AND Comment LIKE '%ntrance%' ORDER BY ID LIMIT 1",
++                        mapa->GetId()).c_str()))
++                {
++                    Field* campos = punto->Fetch();
++                    x = campos[0].GetFloat();
++                    y = campos[1].GetFloat();
++                    z = campos[2].GetFloat();
++                }
++            }
++        }
++
++        if (!mapa)
++        {
++            handler->SendSysMessage("Necesito estar dentro de la instancia, o pasar el cm de una estancia con corrida en curso (nadie adentro = no hay mapa).");
++            TC_LOG_INFO("scripts.miticas", "recorrido (trabas): no hay instancia cargada para el cm {}", cmId ? *cmId : 0);
++            return false;
++        }
++
++        std::string informe = sMythicPlus->DiagnosticoRecorrido(mapa, estancia, x, y, z);
++        // Por consola (SOAP) el texto de `SendSysMessage` no siempre vuelve; el log si.
++        handler->PSendSysMessage("%s", informe.c_str());
++        TC_LOG_INFO("scripts.miticas", "recorrido (diagnostico): {}", informe);
++        return true;
++    }
++
++    // Entrega por CORREO un obsequio declarado en la base, con el contexto de dificultad que
++    // tenga anotado: asi el item sale con el nivel de objeto que le toca (ver ContextoPorNombre).
++    //   .mitica obsequio <personaje> <conjunto>
++    // El personaje puede estar desconectado (el correo queda esperandolo) y anda por consola/SOAP.
++    static bool HandleObsequioCommand(ChatHandler* handler, char const* args)
++    {
++        std::string crudo = args ? args : "";
++        std::vector<char> copia(crudo.begin(), crudo.end());
++        copia.push_back('\0');
++
++        char* nombreArg = strtok(copia.data(), " ");
++        char* conjuntoArg = nombreArg ? strtok(nullptr, " ") : nullptr;
++        if (!nombreArg || !conjuntoArg)
++        {
++            handler->SendSysMessage("Uso: .mitica obsequio <personaje> <conjunto> (los conjuntos estan en world.mitica_obsequio).");
++            return false;
++        }
++        std::string nombre = nombreArg;
++        std::string conjunto = conjuntoArg;
++
++        ObjectGuid guid = sCharacterCache->GetCharacterGuidByName(nombre);
++        if (!guid)
++        {
++            handler->PSendSysMessage("No existe ningun personaje llamado '%s'.", nombre.c_str());
++            return false;
++        }
++
++        QueryResult cabecera = WorldDatabase.Query(Trinity::StringFormat(
++            "SELECT contexto, asunto, cuerpo FROM mitica_obsequio WHERE conjunto = '{}'", conjunto).c_str());
++        if (!cabecera)
++        {
++            handler->PSendSysMessage("No hay ningun obsequio llamado '%s' en world.mitica_obsequio.", conjunto.c_str());
++            return false;
++        }
++        Field* datos = cabecera->Fetch();
++        std::string contextoNombre = datos[0].GetString();
++        std::string asunto = datos[1].GetString();
++        std::string cuerpo = datos[2].GetString();
++
++        Optional<ItemContext> contexto = ContextoPorNombre(contextoNombre);
++        if (!contexto)
++        {
++            handler->PSendSysMessage("El contexto '%s' no lo conozco: revisa la lista en ContextoPorNombre (miticas_custom.cpp).", contextoNombre.c_str());
++            return false;
++        }
++
++        QueryResult filas = WorldDatabase.Query(Trinity::StringFormat(
++            "SELECT item_id, cantidad, etiqueta FROM mitica_obsequio_item WHERE conjunto = '{}' ORDER BY item_id", conjunto).c_str());
++        if (!filas)
++        {
++            handler->PSendSysMessage("El obsequio '%s' no tiene items anotados.", conjunto.c_str());
++            return false;
++        }
++
++        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
++        MailSender remitente(MAIL_NORMAL, 0, MAIL_STATIONERY_GM);
++        std::vector<Item*> lote;
++        uint32 enviados = 0, correos = 0;
++
++        auto mandarLote = [&]()
++        {
++            if (lote.empty())
++                return;
++            MailDraft borrador(asunto, cuerpo);
++            for (Item* pieza : lote)
++                borrador.AddItem(pieza);
++            borrador.SendMailTo(trans, MailReceiver(guid.GetCounter()), remitente);
++            lote.clear();
++            ++correos;
++        };
++
++        do
++        {
++            Field* fila = filas->Fetch();
++            uint32 itemId = fila[0].GetUInt32();
++            uint32 cantidad = fila[1].GetUInt32();
++            std::string etiqueta = fila[2].GetString();
++
++            Item* item = Item::CreateItem(itemId, cantidad, *contexto);
++            if (!item)
++            {
++                TC_LOG_ERROR("scripts.miticas", "obsequio {}: el item {} no se pudo crear", conjunto, itemId);
++                continue;
++            }
++
++            ItemTemplate const* proto = item->GetTemplate();
++            uint32 nivelObjeto = Item::GetItemLevel(proto, *item->GetBonus(), 0,
++                uint32(item->GetRequiredLevel()), 0, 0, 0, false, 0, 0);
++            TC_LOG_INFO("scripts.miticas", "obsequio {} -> {} | item {} x{} | contexto {} | nivel de objeto calculado por el core: {}",
++                conjunto, etiqueta, itemId, cantidad, contextoNombre, nivelObjeto);
++
++            item->SaveToDB(trans);
++            lote.push_back(item);
++            ++enviados;
++
++            if (lote.size() >= MAX_MAIL_ITEMS)
++                mandarLote();
++        } while (filas->NextRow());
++
++        mandarLote();
++        CharacterDatabase.CommitTransaction(trans);
++
++        handler->PSendSysMessage("Obsequio '%s' -> %s: %u items de nivel real en %u correo(s) (contexto %s). El nivel calculado quedo en el log.",
++            conjunto.c_str(), nombre.c_str(), enviados, correos, contextoNombre.c_str());
++        TC_LOG_INFO("scripts.miticas", "obsequio {}: enviados {} items a {} en {} correo(s), contexto {}",
++            conjunto, enviados, nombre, correos, contextoNombre);
++        return true;
++    }
++}; // fin de comando_mitica
++
++// --- NPC de salida: aparece al cerrar la corrida y saca al grupo de la estancia -------------------
++// Todo lo del NPC es DATO (entry y punto de salida en `mitica_estancia.salida_npc`/`salida_punto`,
++// el menu y el texto en `gossip_menu*`/`hotfixes.broadcast_text`); aca solo vive lo que el dato no
++// puede hacer: el teleport. El destino es el que usa el propio cliente para salir de la mazmorra.
++constexpr uint32 MENU_SALIDA_MITICA = 900244;
++
++// El gossip en este core vive en la IA de la criatura (CreatureAI::OnGossipHello/OnGossipSelect):
++// el `CreatureScript` solo elige la IA.
++class npc_mitica_salida_AI : public CreatureAI
++{
++public:
++    explicit npc_mitica_salida_AI(Creature* criatura) : CreatureAI(criatura) { }
++
++    // El guia no hace nada por si solo: solo atiende el gossip.
++    void UpdateAI(uint32 /*diff*/) override { }
++
++    bool OnGossipHello(Player* jugador) override
++    {
++        jugador->PrepareGossipMenu(me, MENU_SALIDA_MITICA);
++        jugador->SendPreparedGossip(me);
++        return true;
++    }
++
++    bool OnGossipSelect(Player* jugador, uint32 /*menuId*/, uint32 /*gossipListId*/) override
++    {
++        uint32 mapaDestino = 0;
++        float x = 0.0f, y = 0.0f, z = 0.0f, o = 0.0f;
++
++        jugador->PlayerTalkClass->SendCloseGossip();
++
++        if (!sMythicPlus->PuntoDeSalida(jugador->GetMapId(), mapaDestino, x, y, z, o))
++        {
++            jugador->GetSession()->SendNotification("Esta estancia no tiene punto de salida configurado.");
++            return true;
++        }
++
++        TC_LOG_INFO("scripts.miticas", "salida: {} pidio salir de la mazmorra {} -> mapa {} ({:.1f} {:.1f} {:.1f})",
++            jugador->GetName(), jugador->GetMapId(), mapaDestino, x, y, z);
++
++        jugador->TeleportTo(mapaDestino, x, y, z, o);
++        return true;
++    }
++};
++
++class npc_mitica_salida : public CreatureScript
++{
++public:
++    npc_mitica_salida() : CreatureScript("npc_mitica_salida") { }
++
++    CreatureAI* GetAI(Creature* criatura) const override
++    {
++        return new npc_mitica_salida_AI(criatura);
++    }
++};
++
++// --- Cofre de recompensa de la mitica+ -----------------------------------------------------------
++// El objeto (goober con gossip, ScriptName `go_cofre_mitica`) NO hace nada por si solo: el botin lo
++// calcula el motor (`sMythicPlus->AbrirCofre`), que sabe el nivel de la piedra de la corrida y arma
++// el item con el contexto y el nivel correctos. Aca solo se atiende el clic.
++class go_cofre_mitica_AI : public GameObjectAI
++{
++public:
++    explicit go_cofre_mitica_AI(GameObject* objeto) : GameObjectAI(objeto) { }
++
++    // El clic del cliente sobre un objeto usable llega por aca (WorldSession::HandleGameobjectReportUse)
++    // y tambien por OnGossipHello si el objeto tiene menu; los dos caminos entregan lo mismo.
++    bool OnReportUse(Player* jugador) override
++    {
++        return sMythicPlus->AbrirCofre(jugador);
++    }
++
++    bool OnGossipHello(Player* jugador) override
++    {
++        return sMythicPlus->AbrirCofre(jugador);
++    }
++};
++
++class go_cofre_mitica : public GameObjectScript
++{
++public:
++    go_cofre_mitica() : GameObjectScript("go_cofre_mitica") { }
++
++    GameObjectAI* GetAI(GameObject* objeto) const override
++    {
++        return new go_cofre_mitica_AI(objeto);
++    }
++};
++} // namespace
++
++void AddSC_miticas_custom()
++{
++    new script_piedras_miticas();
++    new script_miticas_mundo();
++    new comando_mitica();
++    new npc_mitica_salida();
++    new go_cofre_mitica();
++}

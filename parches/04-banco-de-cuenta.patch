@@ -1,0 +1,108 @@
+diff --git a/src/server/game/Handlers/BankHandler.cpp b/src/server/game/Handlers/BankHandler.cpp
+index fd1dd954db..5f90f4cd0b 100644
+--- a/src/server/game/Handlers/BankHandler.cpp
++++ b/src/server/game/Handlers/BankHandler.cpp
+@@ -263,6 +263,45 @@ void WorldSession::HandleUpdateBankTabSettings(WorldPackets::Bank::UpdateBankTab
+     }
+ }
+ 
++// Deposito y retiro de oro del banco de cuenta (el "banco de tropa" del cliente).
++// Estaban como Handle_NULL: el cliente mandaba el pedido y no pasaba nada. El formato del pedido
++// (guid del banquero + uint64 de cobre) y el de la respuesta (el servidor actualiza Coinage y
++// AccountBankCoinage del jugador) estan verificados contra la captura del oficial del 27-sep-2026.
++// El oro del banco NO lo persistia el core: lo guarda Player::SetAccountBankMoney en la tabla
++// character_account_bank, y se carga al entrar (Player::LoadAccountBankMoney).
++void WorldSession::HandleAccountBankDepositMoney(WorldPackets::Bank::AccountBankDepositMoney const& accountBankDepositMoney)
++{
++    if (!CanUseBank(accountBankDepositMoney.Banker))
++        return;
++
++    if (accountBankDepositMoney.Money == 0)
++        return;
++
++    if (!_player->HasEnoughMoney(accountBankDepositMoney.Money))
++    {
++        _player->SendEquipError(EQUIP_ERR_NOT_ENOUGH_MONEY, nullptr, nullptr);
++        return;
++    }
++
++    _player->ModifyMoney(-int64(accountBankDepositMoney.Money));
++    _player->SetAccountBankMoney(_player->GetAccountBankMoney() + accountBankDepositMoney.Money);
++}
++
++void WorldSession::HandleAccountBankWithdrawMoney(WorldPackets::Bank::AccountBankWithdrawMoney const& accountBankWithdrawMoney)
++{
++    if (!CanUseBank(accountBankWithdrawMoney.Banker))
++        return;
++
++    if (accountBankWithdrawMoney.Money == 0)
++        return;
++
++    if (_player->GetAccountBankMoney() < accountBankWithdrawMoney.Money)
++        return;
++
++    _player->SetAccountBankMoney(_player->GetAccountBankMoney() - accountBankWithdrawMoney.Money);
++    _player->ModifyMoney(int64(accountBankWithdrawMoney.Money));
++}
++
+ void WorldSession::HandleAutoDepositCharacterBank(WorldPackets::Bank::AutoDepositCharacterBank const& autoDepositCharacterBank)
+ {
+     if (!CanUseBank(autoDepositCharacterBank.Banker))
+diff --git a/src/server/game/Server/Packets/BankPackets.cpp b/src/server/game/Server/Packets/BankPackets.cpp
+index 59ddb9be34..60a0cf66ab 100644
+--- a/src/server/game/Server/Packets/BankPackets.cpp
++++ b/src/server/game/Server/Packets/BankPackets.cpp
+@@ -41,6 +41,18 @@ void BuyBankTab::Read()
+     _worldPacket >> As<uint8>(BankType);
+ }
+ 
++void AccountBankDepositMoney::Read()
++{
++    _worldPacket >> Banker;
++    _worldPacket >> Money;
++}
++
++void AccountBankWithdrawMoney::Read()
++{
++    _worldPacket >> Banker;
++    _worldPacket >> Money;
++}
++
+ void AutoDepositCharacterBank::Read()
+ {
+     _worldPacket >> Banker;
+diff --git a/src/server/game/Server/Packets/BankPackets.h b/src/server/game/Server/Packets/BankPackets.h
+index 04a0f694bd..6c358fde7f 100644
+--- a/src/server/game/Server/Packets/BankPackets.h
++++ b/src/server/game/Server/Packets/BankPackets.h
+@@ -106,6 +106,30 @@ namespace WorldPackets
+             uint8 Tab = 0;
+             BankTabSettings Settings;
+         };
++
++        // Banco de cuenta (el "banco de tropa" del cliente): pedido verificado en la captura
++        // del oficial - PackedGuid del banquero + uint64 de cobre.
++        class AccountBankDepositMoney final : public ClientPacket
++        {
++        public:
++            explicit AccountBankDepositMoney(WorldPacket&& packet) : ClientPacket(CMSG_ACCOUNT_BANK_DEPOSIT_MONEY, std::move(packet)) { }
++
++            void Read() override;
++
++            ObjectGuid Banker;
++            uint64 Money = 0;
++        };
++
++        class AccountBankWithdrawMoney final : public ClientPacket
++        {
++        public:
++            explicit AccountBankWithdrawMoney(WorldPacket&& packet) : ClientPacket(CMSG_ACCOUNT_BANK_WITHDRAW_MONEY, std::move(packet)) { }
++
++            void Read() override;
++
++            ObjectGuid Banker;
++            uint64 Money = 0;
++        };
+     }
+ }
+ 

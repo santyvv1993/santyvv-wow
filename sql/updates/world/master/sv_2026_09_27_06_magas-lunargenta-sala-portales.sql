@@ -1,0 +1,24 @@
+-- Magas de Lunargenta fuera de la sala de portales de Ventormenta.
+--
+-- Que paso: la acumulacion de poblacion del mapa 0 desde `ref_lw` (LoreWalkerTDB, migracion
+-- `sv_2026_09_18_19_world.sql`) trajo DOS spawns de la entrada 68576 "Silvermoon Mage" /
+-- "Maga de Lunargenta" (guids 3373808481 y 3373808482) a 2,7 y 3,8 yardas del objeto
+-- `Portal to Silvermoon` (guids 3323804235/3323804236) en la sala de portales de Ventormenta.
+--
+-- Por que se sacan: la plantilla de esa entrada trae `faction 1735`, que es la FactionTemplate
+-- de `Faction = 66 "Generico de la Horda"` (FriendGroup = Horda, EnemyGroup = Alianza), asi que
+-- para todo personaje de la Alianza —la sala esta en una capital de la Alianza— salen hostiles y
+-- ademas pelean (SmartAI con 7 reglas de combate: castean sobre la victima cada 20-30 s).
+--
+-- Evidencia de que no son poblacion real de esa sala:
+--   * capturas del oficial de Santiago (ymir, builds 69875/69933, 6 sesiones): la entrada 68576
+--     NUNCA aparece; en la misma sala y franja si aparecen, con coordenadas identicas a las
+--     nuestras, el objeto 621992 (`Portal to Silvermoon`, -9098.56 875.76 68.04) y las criaturas
+--     amistosas 255099 Silvermoon Magister (-9094.1 875.3 68.1) y 255073 Quel'Thalas Adventurer
+--     (-9091.5 881.6 67.4);
+--   * el TDB oficial (1210.26091) solo spawnea la 68576 en Quel'Thalas (mapa 530, -3665.5 3380.1).
+--
+-- Lo que NO se toca: el portal a Lunargenta, el Magister y el Aventurero (esos si coinciden con
+-- el oficial y son amistosos, faction 35).
+
+DELETE FROM `creature` WHERE `guid` IN (3373808481, 3373808482);

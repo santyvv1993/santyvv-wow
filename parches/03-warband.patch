@@ -1,0 +1,921 @@
+diff --git a/src/server/game/Entities/Account/WarbandGroupMgr.cpp b/src/server/game/Entities/Account/WarbandGroupMgr.cpp
+new file mode 100644
+index 0000000000..fd8dff1108
+--- /dev/null
++++ b/src/server/game/Entities/Account/WarbandGroupMgr.cpp
+@@ -0,0 +1,298 @@
++/*
++ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// Mod propio: grupo de escuadra del warband (los campamentos del char-select).
++// El canal de vuelta (SMSG_ENUM_CHARACTERS_RESULT.WarbandGroups) y el de las escenas
++// ya existen en el core; aca vive solo el guardado y la carga de los grupos.
++
++#include "WarbandGroupMgr.h"
++#include "CharacterPackets.h"
++#include "CollectionMgr.h"
++#include "DB2Stores.h"
++#include "DatabaseEnv.h"
++#include "Log.h"
++#include "WorldSession.h"
++#include <algorithm>
++
++WarbandGroupMgr::WarbandGroupMgr(WorldSession* owner) : _owner(owner)
++{
++}
++
++void WarbandGroupMgr::LoadAccountGroups(PreparedQueryResult groupsResult, PreparedQueryResult membersResult)
++{
++    _groups.clear();
++
++    if (groupsResult)
++    {
++        do
++        {
++            Field* fields = groupsResult->Fetch();
++            StoredGroup& group = _groups.emplace_back();
++            group.GroupID = fields[0].GetUInt64();
++            group.OrderIndex = fields[1].GetUInt8();
++            group.WarbandSceneID = fields[2].GetUInt32();
++            group.Flags = fields[3].GetUInt32();
++            group.ContentSetID = fields[4].GetInt32();
++            group.Name = fields[5].GetString();
++        } while (groupsResult->NextRow());
++    }
++
++    if (membersResult)
++    {
++        do
++        {
++            Field* fields = membersResult->Fetch();
++            uint64 groupId = fields[0].GetUInt64();
++
++            StoredGroup* group = nullptr;
++            for (StoredGroup& storedGroup : _groups)
++            {
++                if (storedGroup.GroupID == groupId)
++                {
++                    group = &storedGroup;
++                    break;
++                }
++            }
++
++            if (!group)
++                continue;
++
++            StoredMember& member = group->Members.emplace_back();
++            member.Guid = ObjectGuid::Create<HighGuid::Player>(fields[1].GetUInt64());
++            member.WarbandScenePlacementID = fields[2].GetUInt32();
++            member.Type = fields[3].GetInt32();
++            member.ContentSetID = fields[4].GetInt32();
++        } while (membersResult->NextRow());
++    }
++
++    TC_LOG_INFO("network", "WarbandGroupMgr: cargados {} grupo(s) de escuadra para la cuenta battle.net {}.",
++        _groups.size(), _owner->GetBattlenetAccountId());
++}
++
++uint32 WarbandGroupMgr::GetDefaultWarbandSceneId()
++{
++    for (WarbandSceneEntry const* warbandScene : sWarbandSceneStore)
++        if (warbandScene->GetFlags().HasFlag(WarbandSceneFlags::IsDefault))
++            return warbandScene->ID;
++
++    return 29; // campamento por defecto de retail (fallback si el DB2 no marca ninguno)
++}
++
++void WarbandGroupMgr::EnsureDefaultGroup(std::span<ObjectGuid const> accountCharacterGuids)
++{
++    if (!_groups.empty())
++        return;
++
++    StoredGroup& group = _groups.emplace_back();
++    group.GroupID = 1;
++    group.OrderIndex = 0;
++    group.WarbandSceneID = GetDefaultWarbandSceneId();
++    group.Flags = 0;
++    group.ContentSetID = 0;
++    group.Name = "Favorites";
++
++    uint32 const memberCount = std::min<uint32>(accountCharacterGuids.size(), MaxWarbandGroupMembers);
++    for (uint32 i = 0; i < memberCount; ++i)
++    {
++        StoredMember& member = group.Members.emplace_back();
++        member.Type = 0;
++        member.ContentSetID = 0;
++        member.Guid = accountCharacterGuids[i];
++        // TODO(warband): el warbandScenePlacementId real sale de la tabla hotfix warband_scene_placement
++        // (DB2). En v1 va 0 y se revisa en vivo si el personaje queda de pie en la ranura correcta.
++        member.WarbandScenePlacementID = 0;
++    }
++
++    TC_LOG_INFO("network", "WarbandGroupMgr: cuenta battle.net {} sin escuadra: se guarda el grupo por defecto '{}' (escena {}, {} miembro(s)).",
++        _owner->GetBattlenetAccountId(), group.Name, group.WarbandSceneID, memberCount);
++
++    SaveToDB();
++}
++
++bool WarbandGroupMgr::ReplaceGroups(std::vector<WorldPackets::Character::SetupWarbandGroup> const& groups, CollectionMgr const& collectionMgr, std::unordered_set<ObjectGuid> const& validCharacterGuids)
++{
++    if (groups.size() > MaxWarbandGroups)
++    {
++        TC_LOG_WARN("network", "WarbandGroupMgr: la cuenta battle.net {} mando {} grupos (max {}). Se descarta.",
++            _owner->GetBattlenetAccountId(), groups.size(), MaxWarbandGroups);
++        return false;
++    }
++
++    std::unordered_set<uint64> seenGroupIds;
++    std::unordered_set<ObjectGuid> seenMemberGuids;
++
++    std::vector<StoredGroup> newGroups;
++    newGroups.reserve(groups.size());
++
++    for (WorldPackets::Character::SetupWarbandGroup const& packetGroup : groups)
++    {
++        if (!seenGroupIds.insert(packetGroup.GroupID).second)
++        {
++            TC_LOG_WARN("network", "WarbandGroupMgr: la cuenta battle.net {} mando el groupId {} dos veces. Se descarta.",
++                _owner->GetBattlenetAccountId(), packetGroup.GroupID);
++            return false;
++        }
++
++        if (packetGroup.Members.size() > MaxWarbandGroupMembers)
++        {
++            TC_LOG_WARN("network", "WarbandGroupMgr: la cuenta battle.net {} mando {} miembros en el grupo {} (max {}). Se descarta.",
++                _owner->GetBattlenetAccountId(), packetGroup.Members.size(), packetGroup.GroupID, MaxWarbandGroupMembers);
++            return false;
++        }
++
++        if (!collectionMgr.HasWarbandScene(packetGroup.WarbandSceneID))
++        {
++            TC_LOG_WARN("network", "WarbandGroupMgr: la cuenta battle.net {} uso la escena {} que no tiene. Se descarta.",
++                _owner->GetBattlenetAccountId(), packetGroup.WarbandSceneID);
++            return false;
++        }
++
++        if (packetGroup.Name.empty() || packetGroup.Name.size() > 255)
++        {
++            TC_LOG_WARN("network", "WarbandGroupMgr: la cuenta battle.net {} mando el grupo {} con nombre invalido ({} bytes). Se descarta.",
++                _owner->GetBattlenetAccountId(), packetGroup.GroupID, packetGroup.Name.size());
++            return false;
++        }
++
++        if (packetGroup.OrderIndex >= MaxWarbandGroups)
++        {
++            TC_LOG_WARN("network", "WarbandGroupMgr: la cuenta battle.net {} mando el grupo {} con orderIndex {} fuera de rango. Se descarta.",
++                _owner->GetBattlenetAccountId(), packetGroup.GroupID, packetGroup.OrderIndex);
++            return false;
++        }
++
++        StoredGroup& group = newGroups.emplace_back();
++        group.GroupID = packetGroup.GroupID;
++        group.OrderIndex = packetGroup.OrderIndex;
++        group.WarbandSceneID = packetGroup.WarbandSceneID;
++        group.Flags = packetGroup.Flags;
++        group.ContentSetID = packetGroup.ContentSetID;
++        group.Name = packetGroup.Name;
++
++        for (WorldPackets::Character::WarbandGroupMember const& packetMember : packetGroup.Members)
++        {
++            if (packetMember.Type == 0)
++            {
++                if (!packetMember.Guid)
++                    continue;
++
++                if (!validCharacterGuids.contains(packetMember.Guid))
++                {
++                    TC_LOG_WARN("network", "WarbandGroupMgr: la cuenta battle.net {} mando el guid {} que no es suyo (grupo {}). Se descarta.",
++                        _owner->GetBattlenetAccountId(), packetMember.Guid.ToString(), packetGroup.GroupID);
++                    return false;
++                }
++
++                if (!seenMemberGuids.insert(packetMember.Guid).second)
++                {
++                    TC_LOG_WARN("network", "WarbandGroupMgr: la cuenta battle.net {} repitio el guid {} en la escuadra. Se descarta.",
++                        _owner->GetBattlenetAccountId(), packetMember.Guid.ToString());
++                    return false;
++                }
++            }
++
++            StoredMember& member = group.Members.emplace_back();
++            member.WarbandScenePlacementID = packetMember.WarbandScenePlacementID;
++            member.Type = packetMember.Type;
++            member.ContentSetID = packetMember.ContentSetID;
++            member.Guid = packetMember.Guid;
++        }
++    }
++
++    _groups = std::move(newGroups);
++    SaveToDB();
++
++    TC_LOG_INFO("network", "WarbandGroupMgr: cuenta battle.net {} guardo {} grupo(s) de escuadra.", _owner->GetBattlenetAccountId(), _groups.size());
++
++    return true;
++}
++
++std::vector<WorldPackets::Character::WarbandGroup> WarbandGroupMgr::BuildEnumGroups() const
++{
++    std::vector<WorldPackets::Character::WarbandGroup> result;
++    result.reserve(_groups.size());
++
++    for (StoredGroup const& storedGroup : _groups)
++    {
++        WorldPackets::Character::WarbandGroup& group = result.emplace_back();
++        group.GroupID = storedGroup.GroupID;
++        group.OrderIndex = storedGroup.OrderIndex;
++        group.WarbandSceneID = storedGroup.WarbandSceneID;
++        group.Flags = storedGroup.Flags;
++        group.ContentSetID = storedGroup.ContentSetID;
++        // OJO: WarbandGroup::Name es string_view; apunta al std::string del manager, que vive
++        // lo que vive la sesion (el paquete se arma y se manda dentro de la misma sesion).
++        group.Name = storedGroup.Name;
++        group.Members.reserve(storedGroup.Members.size());
++
++        for (StoredMember const& storedMember : storedGroup.Members)
++        {
++            WorldPackets::Character::WarbandGroupMember& member = group.Members.emplace_back();
++            member.WarbandScenePlacementID = storedMember.WarbandScenePlacementID;
++            member.Type = storedMember.Type;
++            member.ContentSetID = storedMember.ContentSetID;
++            member.Guid = storedMember.Guid;
++        }
++    }
++
++    return result;
++}
++
++void WarbandGroupMgr::SaveToDB()
++{
++    // Replace-all: la escuadra es un conjunto chico y el cliente manda el estado completo,
++    // asi que borrar y reinsertar en una transaccion es mas simple (y no deja filas viejas).
++    LoginDatabaseTransaction trans = LoginDatabase.BeginTransaction();
++
++    LoginDatabasePreparedStatement* stmt = LoginDatabase.GetPreparedStatement(LOGIN_DEL_BNET_WARBAND_GROUP_MEMBERS);
++    stmt->setUInt32(0, _owner->GetBattlenetAccountId());
++    trans->Append(stmt);
++
++    stmt = LoginDatabase.GetPreparedStatement(LOGIN_DEL_BNET_WARBAND_GROUPS);
++    stmt->setUInt32(0, _owner->GetBattlenetAccountId());
++    trans->Append(stmt);
++
++    for (StoredGroup const& group : _groups)
++    {
++        stmt = LoginDatabase.GetPreparedStatement(LOGIN_INS_BNET_WARBAND_GROUP);
++        stmt->setUInt32(0, _owner->GetBattlenetAccountId());
++        stmt->setUInt64(1, group.GroupID);
++        stmt->setUInt8(2, group.OrderIndex);
++        stmt->setUInt32(3, group.WarbandSceneID);
++        stmt->setUInt32(4, group.Flags);
++        stmt->setInt32(5, group.ContentSetID);
++        stmt->setString(6, group.Name);
++        trans->Append(stmt);
++
++        for (StoredMember const& member : group.Members)
++        {
++            if (member.Type == 0 && !member.Guid)
++                continue;
++
++            stmt = LoginDatabase.GetPreparedStatement(LOGIN_INS_BNET_WARBAND_GROUP_MEMBER);
++            stmt->setUInt32(0, _owner->GetBattlenetAccountId());
++            stmt->setUInt64(1, group.GroupID);
++            stmt->setUInt64(2, member.Guid.GetCounter());
++            stmt->setUInt32(3, member.WarbandScenePlacementID);
++            stmt->setInt32(4, member.Type);
++            stmt->setInt32(5, member.ContentSetID);
++            trans->Append(stmt);
++        }
++    }
++
++    LoginDatabase.CommitTransaction(trans);
++}
+diff --git a/src/server/game/Entities/Account/WarbandGroupMgr.h b/src/server/game/Entities/Account/WarbandGroupMgr.h
+new file mode 100644
+index 0000000000..592f5dd305
+--- /dev/null
++++ b/src/server/game/Entities/Account/WarbandGroupMgr.h
+@@ -0,0 +1,76 @@
++/*
++ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// Mod propio: grupo de escuadra del warband (los campamentos del char-select).
++// Estado y decisiones en mods/warband/PLAN-WARBAND.md y REVISION-PLAN-WARBAND.md.
++
++#ifndef TRINITYCORE_WARBAND_GROUP_MGR_H
++#define TRINITYCORE_WARBAND_GROUP_MGR_H
++
++#include "CharacterPackets.h"
++#include "DatabaseEnvFwd.h"
++#include "Define.h"
++#include "ObjectGuid.h"
++#include <span>
++#include <string>
++#include <unordered_set>
++#include <vector>
++
++class CollectionMgr;
++class WorldSession;
++
++class TC_GAME_API WarbandGroupMgr
++{
++public:
++    static constexpr uint32 MaxWarbandGroups = 20;
++    static constexpr uint32 MaxWarbandGroupMembers = 4;
++
++    explicit WarbandGroupMgr(WorldSession* owner);
++
++    void LoadAccountGroups(PreparedQueryResult groupsResult, PreparedQueryResult membersResult);
++    void EnsureDefaultGroup(std::span<ObjectGuid const> accountCharacterGuids);
++    bool ReplaceGroups(std::vector<WorldPackets::Character::SetupWarbandGroup> const& groups, CollectionMgr const& collectionMgr, std::unordered_set<ObjectGuid> const& validCharacterGuids);
++    std::vector<WorldPackets::Character::WarbandGroup> BuildEnumGroups() const;
++
++private:
++    struct StoredMember
++    {
++        uint32 WarbandScenePlacementID = 0;
++        int32 Type = 0;
++        int32 ContentSetID = 0;
++        ObjectGuid Guid;
++    };
++
++    struct StoredGroup
++    {
++        uint64 GroupID = 0;
++        uint8 OrderIndex = 0;
++        uint32 WarbandSceneID = 0;
++        uint32 Flags = 0;
++        int32 ContentSetID = 0;
++        std::vector<StoredMember> Members;
++        std::string Name;
++    };
++
++    static uint32 GetDefaultWarbandSceneId();
++    void SaveToDB();
++
++    WorldSession* _owner;
++    std::vector<StoredGroup> _groups;
++};
++
++#endif // TRINITYCORE_WARBAND_GROUP_MGR_H
+diff --git a/src/server/game/Handlers/CharacterHandler.cpp b/src/server/game/Handlers/CharacterHandler.cpp
+index 518d9fac76..e5728f7afa 100644
+--- a/src/server/game/Handlers/CharacterHandler.cpp
++++ b/src/server/game/Handlers/CharacterHandler.cpp
+@@ -63,6 +63,7 @@
+ #include "SystemPackets.h"
+ #include "TransmogMgr.h"
+ #include "Util.h"
++#include "WarbandGroupMgr.h"
+ #include "World.h"
+ #include <boost/circular_buffer.hpp>
+ #include <sstream>
+@@ -502,6 +503,17 @@ void WorldSession::HandleCharEnum(CharacterDatabaseQueryHolder const& holder)
+         });
+     }
+ 
++    // Mod propio: la escuadra del warband (grupos/campamentos) viaja dentro de este paquete.
++    std::vector<ObjectGuid> accountCharacterGuids;
++    accountCharacterGuids.reserve(charEnum.Characters.size());
++    for (WorldPackets::Character::EnumCharactersResult::CharacterInfo const& charInfo : charEnum.Characters)
++        accountCharacterGuids.push_back(charInfo.Basic.Guid);
++
++    if (!charEnum.IsDeletedCharacters)
++        _warbandGroupMgr->EnsureDefaultGroup(accountCharacterGuids);
++
++    charEnum.WarbandGroups = _warbandGroupMgr->BuildEnumGroups();
++
+     SendPacket(charEnum.Write());
+ 
+     if (!charEnum.IsDeletedCharacters)
+@@ -528,6 +540,23 @@ void WorldSession::HandleCharEnumOpcode(WorldPackets::Character::EnumCharacters&
+     });
+ }
+ 
++// Mod propio: el cliente confirma su escuadra (campamentos) al salir del char-select.
++// No hay respuesta: el cliente vuelve a pedir la lista de personajes y ahi recibe el estado.
++void WorldSession::HandleSetupWarbandGroups(WorldPackets::Character::SetupWarbandGroups& setupWarbandGroups)
++{
++    // Solo se guardan personajes de la cuenta (ni guids inventados ni de otro jugador).
++    std::unordered_set<ObjectGuid> validCharacterGuids;
++    if (QueryResult result = CharacterDatabase.PQuery("SELECT guid FROM characters WHERE account = {} AND deleteInfos_Name IS NULL", GetAccountId()))
++    {
++        do
++        {
++            validCharacterGuids.insert(ObjectGuid::Create<HighGuid::Player>(result->Fetch()[0].GetUInt64()));
++        } while (result->NextRow());
++    }
++
++    GetWarbandGroupMgr()->ReplaceGroups(setupWarbandGroups.Groups, *GetCollectionMgr(), validCharacterGuids);
++}
++
+ void WorldSession::HandleCharUndeleteEnumOpcode(WorldPackets::Character::EnumCharacters& /*enumCharacters*/)
+ {
+     /// get all the data necessary for loading all undeleted characters (along with their pets) on the account
+diff --git a/src/server/game/Server/Packets/CharacterPackets.cpp b/src/server/game/Server/Packets/CharacterPackets.cpp
+index 309b4fef91..50f701b125 100644
+--- a/src/server/game/Server/Packets/CharacterPackets.cpp
++++ b/src/server/game/Server/Packets/CharacterPackets.cpp
+@@ -19,9 +19,11 @@
+ #include "ClubUtils.h"
+ #include "DB2Stores.h"
+ #include "Field.h"
++#include "Log.h"
+ #include "ObjectMgr.h"
+ #include "PacketOperators.h"
+ #include "Player.h"
++#include "WarbandGroupMgr.h"
+ #include "World.h"
+ 
+ namespace UF
+@@ -398,6 +400,74 @@ ByteBuffer& operator<<(ByteBuffer& data, WarbandGroup const& warbandGroup)
+     return data;
+ }
+ 
++// Mod propio: lectura del CMSG_SETUP_WARBAND_GROUPS (ver mods/warband/REVISION-PLAN-WARBAND.md).
++// Unico dato del formato que no es campo-a-campo en el mismo orden que el SMSG: la cabecera
++// (cantidad de grupos en los 5 bits altos del primer byte) y el nombre (9 bits de tamano + bytes).
++ByteBuffer& operator>>(ByteBuffer& data, WarbandGroupMember& warbandGroupMember)
++{
++    data >> warbandGroupMember.WarbandScenePlacementID;
++    data >> warbandGroupMember.Type;
++    data >> warbandGroupMember.ContentSetID;
++    if (warbandGroupMember.Type == 0)
++        data >> warbandGroupMember.Guid;
++
++    return data;
++}
++
++ByteBuffer& operator>>(ByteBuffer& data, SetupWarbandGroup& warbandGroup)
++{
++    data >> warbandGroup.GroupID;
++    data >> warbandGroup.OrderIndex;
++    data >> warbandGroup.WarbandSceneID;
++    data >> warbandGroup.Flags;
++    data >> warbandGroup.ContentSetID;
++    data >> Size<uint32>(warbandGroup.Members);
++
++    for (WarbandGroupMember& member : warbandGroup.Members)
++        data >> member;
++
++    // ResetBitPos() antes del bloque de bits: deja el lector alineado al byte.
++    // NO se llama FlushBits() al leer: en el camino de lectura FlushBits() agrega un byte
++    // al buffer (append) en vez de descartar bits, e infla el tamano del paquete.
++    data.ResetBitPos();
++    data >> SizedString::BitsSize<9>(warbandGroup.Name);
++    data >> SizedString::Data(warbandGroup.Name);
++
++    return data;
++}
++
++void SetupWarbandGroups::Read()
++{
++    // Cabecera: 5 bits altos del primer byte = cantidad de grupos (sniff 12.0.7: 0x08 = 1 grupo,
++    // 0x10 = 2, 0x18 = 3). Leer los 5 bits MSB-first equivale a header >> 3.
++    uint8 header;
++    _worldPacket >> header;
++
++    uint32 const groupCount = header >> 3;
++    if (groupCount > WarbandGroupMgr::MaxWarbandGroups)
++    {
++        TC_LOG_WARN("network", "SetupWarbandGroups: cabecera 0x{:02X} => {} grupo(s); el maximo es {}. Se ignora el paquete.",
++            header, groupCount, WarbandGroupMgr::MaxWarbandGroups);
++        return;
++    }
++
++    Groups.resize(groupCount);
++    for (uint32 i = 0; i < groupCount; ++i)
++        _worldPacket >> Groups[i];
++
++    // Evidencia para el paso 1 del plan: que mando el cliente, campo a campo.
++    TC_LOG_INFO("network", "SetupWarbandGroups: cabecera 0x{:02X} => {} grupo(s).", header, groupCount);
++    for (SetupWarbandGroup const& group : Groups)
++    {
++        TC_LOG_INFO("network", "  grupo {}: orden {}, escena {}, flags {}, contentSet {}, nombre '{}', {} miembro(s).",
++            group.GroupID, group.OrderIndex, group.WarbandSceneID, group.Flags, group.ContentSetID, group.Name, group.Members.size());
++
++        for (WarbandGroupMember const& member : group.Members)
++            TC_LOG_INFO("network", "    miembro: type {}, ranura {}, contentSet {}, guid {}.",
++                member.Type, member.WarbandScenePlacementID, member.ContentSetID, member.Guid.ToString());
++    }
++}
++
+ EnumCharactersResult::CharacterInfo::CharacterInfo(Field const* fields) : Basic(fields)
+ {
+ }
+diff --git a/src/server/game/Server/Packets/CharacterPackets.h b/src/server/game/Server/Packets/CharacterPackets.h
+index 9806bb00bd..256c330498 100644
+--- a/src/server/game/Server/Packets/CharacterPackets.h
++++ b/src/server/game/Server/Packets/CharacterPackets.h
+@@ -135,6 +135,29 @@ namespace WorldPackets
+             std::string_view Name;
+         };
+ 
++        // Mod propio: lo que el cliente manda al confirmar la escuadra (CMSG_SETUP_WARBAND_GROUPS).
++        // Mismos campos que WarbandGroup, pero con dueño propio del nombre (std::string).
++        struct SetupWarbandGroup
++        {
++            uint64 GroupID = 0;
++            uint8 OrderIndex = 0;
++            uint32 WarbandSceneID = 0;
++            uint32 Flags = 0;
++            int32 ContentSetID = 0;
++            std::vector<WarbandGroupMember> Members;
++            std::string Name;
++        };
++
++        class SetupWarbandGroups final : public ClientPacket
++        {
++        public:
++            explicit SetupWarbandGroups(WorldPacket&& packet) : ClientPacket(CMSG_SETUP_WARBAND_GROUPS, std::move(packet)) { }
++
++            void Read() override;
++
++            std::vector<SetupWarbandGroup> Groups;
++        };
++
+         class EnumCharactersResult final : public ServerPacket
+         {
+         public:
+diff --git a/src/server/scripts/Custom/mentoria_warband_custom.cpp b/src/server/scripts/Custom/mentoria_warband_custom.cpp
+new file mode 100644
+index 0000000000..4c4faf212e
+--- /dev/null
++++ b/src/server/scripts/Custom/mentoria_warband_custom.cpp
+@@ -0,0 +1,350 @@
++/*
++ * ============================================================================
++ *  mentoria_warband_custom.cpp - TUTORIA DE ESCUADRA (Warband Mentorship)
++ * ============================================================================
++ *
++ *  QUE ES (diseno de retail, no inventado):
++ *  cada personaje de nivel maximo de la cuenta le da a los personajes que todavia
++ *  NO estan en el maximo un +5 % de experiencia, y el total tope es +25 %. El
++ *  bono es de CUENTA (battle.net), no de reino ni de personaje.
++ *
++ *  POR QUE ES UN MOD PROPIO Y NO UNA MIGRACION
++ *  El core no tiene nada de esto: no hay columna, ni config, ni gancho de XP con
++ *  bono de cuenta. Lo que SI tiene es el gancho de XP que hace falta
++ *  (`PlayerScript::OnGiveXP`, llamado desde `Player::GiveXP` tanto para muertes
++ *  como para misiones) — o sea que no hay que parchear el core: alcanza con un
++ *  guion propio. Este archivo es esa pieza y nada mas.
++ *
++ *  NADA QUEMADO: los cuatro numeros y los textos viven en `world.mentoria_warband`
++ *  (clave/valor) y se recargan con `.mentoria recargar` sin recompilar:
++ *      activo               0|1
++ *      pct_por_personaje    bono por cada personaje de nivel maximo (retail: 5)
++ *      pct_max              tope del bono (retail: 25)
++ *      texto_aviso          el aviso que ve el jugador al entrar (con {n} y {pct})
++ *
++ *  EL DATO DURO: cuantos personajes de nivel maximo tiene la cuenta. Se cuenta en
++ *  la base de personajes (`characters.characters`), filtrando por las cuentas de
++ *  juego de esa cuenta de battle.net (`auth.account.battlenet_account`, que es la
++ *  columna que ya usa el modulo del grupo de escuadra). Se recalcula al entrar, al
++ *  subir de nivel y cuando el cache cumple `segundos_cache` — asi no se consulta la
++ *  base en cada muerte.
++ *
++ *  COMANDOS (todos Console::Yes: andan por SOAP, sin cliente abierto):
++ *      .mentoria estado            configuracion + el bono de cada jugador conectado
++ *      .mentoria recargar          relee world.mentoria_warband
++ *      .mentoria pj <personaje>    radiografia de un personaje (nivel, max-levels, bono)
++ *
++ *  LIMITE DECLARADO: el bono se aplica al XP que el servidor concede (muertes,
++ *  misiones, descubrimientos de zona). El XP "rested" (descansado) lo suma el core
++ *  DESPUES de este gancho, asi que el bono no multiplica la parte descansada — es
++ *  la misma composicion que usa retail y conviene no tocarla.
++ * ============================================================================
++ */
++
++#include "Chat.h"
++#include "ChatCommand.h"
++#include "DatabaseEnv.h"
++#include "Log.h"
++#include "Player.h"
++#include "ScriptMgr.h"
++#include "StringFormat.h"
++#include "World.h"
++#include "WorldSession.h"
++
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++using namespace Trinity::ChatCommands;
++
++namespace
++{
++// ----------------------------------------------------------------------------
++// configuracion y cache (una sola copia viva en el proceso)
++// ----------------------------------------------------------------------------
++struct MentoriaWarband
++{
++    bool   Activo = true;
++    uint32 PctPorPersonaje = 5;      // retail
++    uint32 PctMax = 25;              // retail
++    uint32 SegundosCache = 300;
++    std::string TextoAviso = "Tutoria de escuadra: +{pct}% de experiencia ({n} personajes al maximo).";
++
++    // guid -> (bono %, cuando se calculo)
++    std::unordered_map<ObjectGuid, std::pair<uint32, uint32>> Cache;
++
++    void CargarConfig()
++    {
++        Activo = true;
++        PctPorPersonaje = 5;
++        PctMax = 25;
++        SegundosCache = 300;
++        TextoAviso = "Tutoria de escuadra: +{pct}% de experiencia ({n} personajes al maximo).";
++        Cache.clear();
++
++        QueryResult resultado = WorldDatabase.Query("SELECT clave, valor FROM mentoria_warband");
++        if (!resultado)
++        {
++            TC_LOG_INFO("scripts.mentoria", "mentoria de escuadra: no hay filas en world.mentoria_warband; se usa el default (activo, +{}% por personaje, tope {}%)",
++                PctPorPersonaje, PctMax);
++            return;
++        }
++
++        do
++        {
++            Field* campos = resultado->Fetch();
++            std::string clave = campos[0].GetString();
++            std::string valor = campos[1].GetString();
++
++            if (clave == "activo")
++                Activo = (valor == "1" || valor == "true" || valor == "si");
++            else if (clave == "pct_por_personaje")
++                PctPorPersonaje = uint32(strtoul(valor.c_str(), nullptr, 10));
++            else if (clave == "pct_max")
++                PctMax = uint32(strtoul(valor.c_str(), nullptr, 10));
++            else if (clave == "segundos_cache")
++                SegundosCache = uint32(strtoul(valor.c_str(), nullptr, 10));
++            else if (clave == "texto_aviso")
++                TextoAviso = valor;
++        }
++        while (resultado->NextRow());
++
++        TC_LOG_INFO("scripts.mentoria", "mentoria de escuadra: {} ({}% por personaje de nivel maximo, tope {}%, cache {} s)",
++            Activo ? "activa" : "apagada", PctPorPersonaje, PctMax, SegundosCache);
++    }
++
++    // Cuenta los personajes de nivel maximo de la MISMA cuenta de battle.net.
++    // Dos consultas porque auth y characters son bases distintas: primero las cuentas de
++    // juego de esa cuenta de battle.net, despues los personajes.
++    uint32 PersonajesAlMaximo(uint32 battlenetAccountId, uint32 nivelMaximo) const
++    {
++        std::string lista;
++        if (QueryResult cuentas = LoginDatabase.PQuery("SELECT id FROM account WHERE battlenet_account = {}", battlenetAccountId))
++        {
++            do
++            {
++                if (!lista.empty())
++                    lista += ",";
++                lista += std::to_string(cuentas->Fetch()[0].GetUInt32());
++            }
++            while (cuentas->NextRow());
++        }
++
++        if (lista.empty())
++            return 0;
++
++        QueryResult personajes = CharacterDatabase.PQuery(
++            "SELECT COUNT(*) FROM characters WHERE account IN ({}) AND level >= {}", lista, nivelMaximo);
++        if (!personajes)
++            return 0;
++
++        return personajes->Fetch()[0].GetUInt32();
++    }
++
++    uint32 BonoDe(Player* jugador, bool recalcular = false)
++    {
++        if (!jugador)
++            return 0;
++
++        if (!Activo || jugador->IsMaxLevel())
++            return 0;
++
++        uint32 ahora = uint32(time(nullptr));
++        auto it = Cache.find(jugador->GetGUID());
++        if (!recalcular && it != Cache.end() && (ahora - it->second.second) < SegundosCache)
++            return it->second.first;
++
++        uint32 nivelMaximo = uint32(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
++        uint32 cuantos = PersonajesAlMaximo(jugador->GetSession()->GetBattlenetAccountId(), nivelMaximo);
++        uint32 pct = cuantos * PctPorPersonaje;
++        if (pct > PctMax)
++            pct = PctMax;
++
++        Cache[jugador->GetGUID()] = { pct, ahora };
++        return pct;
++    }
++
++    void Olvidar(ObjectGuid guid) { Cache.erase(guid); }
++
++    std::string TextoDe(Player* jugador)
++    {
++        uint32 pct = BonoDe(jugador);
++        uint32 cuantos = PctPorPersonaje ? pct / PctPorPersonaje : 0;
++        std::string texto = TextoAviso;
++        auto reemplazar = [&texto](std::string const& de, std::string const& a)
++        {
++            for (size_t p = texto.find(de); p != std::string::npos; p = texto.find(de, p + a.size()))
++                texto.replace(p, de.size(), a);
++        };
++        reemplazar("{pct}", std::to_string(pct));
++        reemplazar("{n}", std::to_string(cuantos));
++        return texto;
++    }
++};
++
++MentoriaWarband& Mentoria()
++{
++    static MentoriaWarband instancia;
++    return instancia;
++}
++
++// ----------------------------------------------------------------------------
++// los enganches de juego
++// ----------------------------------------------------------------------------
++class script_mentoria_jugador : public PlayerScript
++{
++public:
++    script_mentoria_jugador() : PlayerScript("script_mentoria_jugador") { }
++
++    void OnLogin(Player* jugador, bool /*primerIngreso*/) override
++    {
++        uint32 pct = Mentoria().BonoDe(jugador, true);
++        if (!Mentoria().Activo || jugador->IsMaxLevel())
++            return;
++
++        TC_LOG_INFO("scripts.mentoria", "mentoria: {} (nivel {}) tiene +{}% de experiencia", jugador->GetName(), jugador->GetLevel(), pct);
++        if (pct)
++            jugador->GetSession()->SendNotification("%s", Mentoria().TextoDe(jugador).c_str());
++    }
++
++    void OnLevelChanged(Player* jugador, uint8 /*nivelAnterior*/) override
++    {
++        // un personaje que llega al maximo cambia el bono de TODOS los de la cuenta:
++        Mentoria().Cache.clear();
++        Mentoria().BonoDe(jugador, true);
++    }
++
++    void OnLogout(Player* jugador) override
++    {
++        Mentoria().Olvidar(jugador->GetGUID());
++    }
++
++    void OnGiveXP(Player* jugador, uint32& cantidad, Unit* /*victima*/) override
++    {
++        if (!cantidad)
++            return;
++
++        uint32 pct = Mentoria().BonoDe(jugador);
++        if (!pct)
++            return;
++
++        uint32 antes = cantidad;
++        cantidad = uint32(uint64(cantidad) * (100 + pct) / 100);
++        if (cantidad > antes)
++            TC_LOG_DEBUG("scripts.mentoria", "mentoria: {} recibe {} de XP en vez de {} (+{}%)",
++                jugador->GetName(), cantidad, antes, pct);
++    }
++};
++
++class script_mentoria_mundo : public WorldScript
++{
++public:
++    script_mentoria_mundo() : WorldScript("script_mentoria_mundo") { }
++
++    void OnStartup() override
++    {
++        Mentoria().CargarConfig();
++    }
++};
++
++// ----------------------------------------------------------------------------
++// los comandos
++// ----------------------------------------------------------------------------
++class comando_mentoria : public CommandScript
++{
++public:
++    comando_mentoria() : CommandScript("comando_mentoria") { }
++
++    std::span<ChatCommandBuilder const> GetCommands() const override
++    {
++        static ChatCommandTable mentoriaCommandTable =
++        {
++            { "estado",   HandleEstadoCommand,   rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++            { "recargar", HandleRecargarCommand, rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++            { "pj",       HandlePjCommand,       rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++        };
++        static ChatCommandTable commandTable =
++        {
++            { "mentoria", mentoriaCommandTable },
++        };
++        return commandTable;
++    }
++
++    static bool HandleEstadoCommand(ChatHandler* handler)
++    {
++        MentoriaWarband& m = Mentoria();
++        // PSendSysMessage es estilo printf (%u): con llaves imprime el {} literal. Se arma el texto.
++        handler->SendSysMessage(Trinity::StringFormat(
++            "Tutoria de escuadra: {} | {}% por personaje de nivel maximo | tope {}% | cache {} s",
++            m.Activo ? "ACTIVA" : "APAGADA", m.PctPorPersonaje, m.PctMax, m.SegundosCache));
++        handler->SendSysMessage(Trinity::StringFormat("Nivel maximo del reino: {}",
++            sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL)));
++
++        bool alguno = false;
++        for (auto const& sesion : sWorld->GetAllSessions())
++        {
++            Player* jugador = sesion.second->GetPlayer();
++            if (!jugador)
++                continue;
++            alguno = true;
++            handler->SendSysMessage(Trinity::StringFormat("   {} (nivel {}): +{}%",
++                jugador->GetName(), jugador->GetLevel(), m.BonoDe(jugador, true)));
++        }
++        if (!alguno)
++            handler->SendSysMessage("   (no hay jugadores conectados)");
++        return true;
++    }
++
++    static bool HandleRecargarCommand(ChatHandler* handler)
++    {
++        Mentoria().CargarConfig();
++        handler->SendSysMessage("Tutoria de escuadra: configuracion recargada desde world.mentoria_warband.");
++        return true;
++    }
++
++    // .mentoria pj <personaje>
++    static bool HandlePjCommand(ChatHandler* handler, char const* args)
++    {
++        std::string nombre = args ? args : "";
++        while (!nombre.empty() && (nombre.back() == ' ' || nombre.back() == '\t'))
++            nombre.pop_back();
++
++        if (nombre.empty())
++        {
++            handler->SendSysMessage("Uso: .mentoria pj <personaje>");
++            return false;
++        }
++
++        Player* jugador = nullptr;
++        for (auto const& sesion : sWorld->GetAllSessions())
++        {
++            Player* p = sesion.second->GetPlayer();
++            if (p && p->GetName() == nombre)
++            {
++                jugador = p;
++                break;
++            }
++        }
++
++        if (!jugador)
++        {
++            handler->SendSysMessage(Trinity::StringFormat("El personaje '{}' no esta conectado.", nombre));
++            return false;
++        }
++
++        uint32 nivelMaximo = uint32(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
++        uint32 cuantos = Mentoria().PersonajesAlMaximo(jugador->GetSession()->GetBattlenetAccountId(), nivelMaximo);
++        handler->SendSysMessage(Trinity::StringFormat(
++            "{}: nivel {} (maximo del reino {}), personajes al maximo en la cuenta: {}, bono: +{}%",
++            jugador->GetName(), jugador->GetLevel(), nivelMaximo, cuantos, Mentoria().BonoDe(jugador, true)));
++        return true;
++    }
++};
++} // namespace
++
++void AddSC_mentoria_warband()
++{
++    new script_mentoria_jugador();
++    new script_mentoria_mundo();
++    new comando_mentoria();
++}

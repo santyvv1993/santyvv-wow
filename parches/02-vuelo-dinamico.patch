@@ -1,0 +1,1445 @@
+diff --git a/src/server/game/Server/Packets/MovementPackets.cpp b/src/server/game/Server/Packets/MovementPackets.cpp
+index 9e04cad9bf..9971d1c1fc 100644
+--- a/src/server/game/Server/Packets/MovementPackets.cpp
++++ b/src/server/game/Server/Packets/MovementPackets.cpp
+@@ -1243,6 +1243,16 @@ WorldPacket const* MoveUpdateRemoveInertia::Write()
+     return &_worldPacket;
+ }
+ 
++// Vuelo dinamico: el empujon de las habilidades activas de cielonautica.
++WorldPacket const* MoveAddImpulse::Write()
++{
++    _worldPacket << MoverGUID;
++    _worldPacket << uint32(SequenceIndex);
++    _worldPacket << Direction;
++
++    return &_worldPacket;
++}
++
+ void MoveForceGravityModifierChangeAck::Read()
+ {
+     _worldPacket >> Ack;
+diff --git a/src/server/game/Server/Packets/MovementPackets.h b/src/server/game/Server/Packets/MovementPackets.h
+index 67f36c4ea7..c5c4f5ccba 100644
+--- a/src/server/game/Server/Packets/MovementPackets.h
++++ b/src/server/game/Server/Packets/MovementPackets.h
+@@ -265,6 +265,21 @@ namespace WorldPackets
+             uint32 SequenceIndex = 0; ///< Unit movement packet index, incremented each time
+         };
+ 
++        // Vuelo dinamico: el empujon de las habilidades activas de cielonautica (Ascenso al
++        // cielo, Impulso de avance, Aceleracion giratoria). El cliente lo ackea con
++        // CMSG_MOVE_ADD_IMPULSE_ACK.
++        class MoveAddImpulse final : public ServerPacket
++        {
++        public:
++            MoveAddImpulse() : ServerPacket(SMSG_MOVE_ADD_IMPULSE, 16 + 4 + 4 * 3) { }
++
++            WorldPacket const* Write() override;
++
++            ObjectGuid MoverGUID;
++            uint32 SequenceIndex = 0;
++            TaggedPosition<Position::XYZ> Direction;
++        };
++
+         struct ShipTransferPending
+         {
+             uint32 ID = 0;              ///< gameobject_template.entry of the transport the player is teleporting on
+diff --git a/src/server/game/VueloDinamico/VueloDinamicoMgr.cpp b/src/server/game/VueloDinamico/VueloDinamicoMgr.cpp
+new file mode 100644
+index 0000000000..e6ba730944
+--- /dev/null
++++ b/src/server/game/VueloDinamico/VueloDinamicoMgr.cpp
+@@ -0,0 +1,733 @@
++/*
++ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include "VueloDinamicoMgr.h"
++
++#include "DatabaseEnv.h"
++#include "DB2Stores.h"
++#include "DBCEnums.h"
++#include "EventProcessor.h"
++#include "Log.h"
++#include "ObjectAccessor.h"
++#include "Player.h"
++#include "StringFormat.h"
++#include "Unit.h"
++
++#include <cmath>
++
++namespace Trinity
++{
++namespace VueloDinamico
++{
++namespace
++{
++// La FASE 2 del ascenso: el tren de empujes suaves que retail manda DESPUES del empujon vertical.
++// Medido en la sesion de vuelo del 21-sep-2026 (437 SMSG_MOVE_ADD_IMPULSE): 5-6 empujes de 5.0 cada
++// 102 ms hacia donde vuela el draco, arrancando 0.71 s despues del 45. Sin esta fase el draco sube y
++// a los ~0.7 s se queda sin empuje: eso era el "casi no tiene fuerza, al medio segundo cae".
++// Va como evento del propio jugador, asi muere con el si se desconecta.
++class EventoTrenAscenso : public BasicEvent
++{
++public:
++    EventoTrenAscenso(ObjectGuid guid, uint32 restantes)
++        : BasicEvent(), _guid(guid), _restantes(restantes) { }
++
++    bool Execute(uint64 /*e_time*/, uint32 /*p_time*/) override
++    {
++        Player* jugador = ObjectAccessor::FindPlayer(_guid);
++        if (!jugador || !jugador->IsInWorld())
++            return true;
++
++        // Si dejo de estar en modo dinamico (desmonto, cambio de zona, se apago el modo) el tren
++        // se corta solo: no queda empujando a alguien que ya esta en vuelo estable.
++        if (!sVueloDinamico->Habilitado() || !jugador->HasUnitMovementFlag(MOVEMENTFLAG_CAN_ADV_FLY))
++            return true;
++
++        sVueloDinamico->EmpujarHaciaDondeVuela(jugador, sVueloDinamico->TrenAscensoVelocidad());
++
++        if (_restantes > 1)
++            jugador->m_Events.AddEvent(new EventoTrenAscenso(_guid, _restantes - 1),
++                Milliseconds(sVueloDinamico->TrenAscensoIntervaloMs()));
++
++        return true;
++    }
++
++private:
++    ObjectGuid _guid;
++    uint32 _restantes;
++};
++} // namespace
++
++Mgr* Mgr::instance()
++{
++    static Mgr instancia;
++    return &instancia;
++}
++
++// ----------------------------------------------------------------------------
++// configuracion: todo sale de world.vuelo_* (nada quemado en el codigo)
++// ----------------------------------------------------------------------------
++void Mgr::CargarConfig()
++{
++    _config.clear();
++    _habilidades.clear();
++    _requisitos.clear();
++    _impulsos.clear();
++    _zonas.clear();
++
++    if (QueryResult config = WorldDatabase.Query("SELECT clave, valor FROM vuelo_config"))
++        do
++        {
++            Field* campos = config->Fetch();
++            _config[campos[0].GetString()] = campos[1].GetString();
++        } while (config->NextRow());
++
++    if (QueryResult habilidades = WorldDatabase.Query(
++            "SELECT hechizo, nivel_minimo, nota FROM vuelo_habilidad ORDER BY nivel_minimo, hechizo"))
++        do
++        {
++            Field* campos = habilidades->Fetch();
++            Habilidad h;
++            h.Hechizo = campos[0].GetUInt32();
++            h.NivelMinimo = campos[1].GetUInt32();
++            h.Nota = campos[2].GetString();
++            _habilidades.push_back(h);
++        } while (habilidades->NextRow());
++
++    if (QueryResult requisitos = WorldDatabase.Query("SELECT hechizo FROM vuelo_requisito"))
++        do
++            _requisitos.push_back(requisitos->Fetch()[0].GetUInt32());
++        while (requisitos->NextRow());
++
++    if (QueryResult impulsos = WorldDatabase.Query("SELECT hechizo, tipo, velocidad, nota FROM vuelo_impulso"))
++        do
++        {
++            Field* campos = impulsos->Fetch();
++            std::string tipo = campos[1].GetString();
++            Impulso i;
++            i.Hechizo = campos[0].GetUInt32();
++            i.Tipo = tipo == "ascenso" ? TipoImpulso::Ascenso
++                   : tipo == "giro" ? TipoImpulso::Giro
++                   : TipoImpulso::Avance;
++            i.Velocidad = campos[2].GetFloat();
++            i.Nota = campos[3].GetString();
++            _impulsos[i.Hechizo] = i;
++        } while (impulsos->NextRow());
++
++    if (_config.empty())
++        TC_LOG_ERROR("server.loading", "vuelo dinamico: world.vuelo_config esta vacia (se usan los valores por defecto del codigo); corre la migracion 2026_09_16_29_world.sql");
++
++    // Las zonas con regla propia (vacia = en todas se vuela como dice el estilo de vuelo)
++    if (QueryResult zonas = WorldDatabase.Query("SELECT area_id, permite, nota FROM vuelo_zona"))
++        do
++        {
++            Field* campos = zonas->Fetch();
++            std::string permite = campos[1].GetString();
++            Zona zona;
++            zona.AreaId = campos[0].GetUInt32();
++            zona.Regla = permite == "nada" ? ReglaZona::Nada
++                       : permite == "estable" ? ReglaZona::Estable
++                       : ReglaZona::Todo;
++            zona.Nota = campos[2].GetString();
++            _zonas[zona.AreaId] = zona;
++        } while (zonas->NextRow());
++
++    TC_LOG_INFO("server.loading", "vuelo dinamico: {} claves, {} habilidades, {} requisitos de equitacion, {} impulsos, {} zonas con regla",
++        _config.size(), _habilidades.size(), _requisitos.size(), _impulsos.size(), _zonas.size());
++}
++
++std::string Mgr::Config(std::string const& clave, std::string const& porDefecto) const
++{
++    auto it = _config.find(clave);
++    return it == _config.end() ? porDefecto : it->second;
++}
++
++uint32 Mgr::ConfigNumero(std::string const& clave, uint32 porDefecto) const
++{
++    auto it = _config.find(clave);
++    if (it == _config.end() || it->second.empty())
++        return porDefecto;
++
++    try
++    {
++        return uint32(std::stoul(it->second));
++    }
++    catch (std::exception const&)
++    {
++        TC_LOG_ERROR("server.loading", "vuelo dinamico: vuelo_config['{}'] = '{}' no es un numero", clave, it->second);
++        return porDefecto;
++    }
++}
++
++float Mgr::ConfigFlotante(std::string const& clave, float porDefecto) const
++{
++    auto it = _config.find(clave);
++    if (it == _config.end() || it->second.empty())
++        return porDefecto;
++
++    try
++    {
++        return std::stof(it->second);
++    }
++    catch (std::exception const&)
++    {
++        TC_LOG_ERROR("server.loading", "vuelo dinamico: vuelo_config['{}'] = '{}' no es un numero", clave, it->second);
++        return porDefecto;
++    }
++}
++
++// PARCHES-PROPIOS: el cliente necesita SMSG_MOVE_SET_FLIGHT_SPEED con la velocidad del modo.
++// Medido en retail: 29.4 (420%) con el vuelo dinamico encendido, 7.7 al apagarlo, siempre en el
++// mismo instante que el cambio de modo. Sin esto el cliente queda con la velocidad del modo
++// anterior (7.0/7.7) mientras el aero usa un tope de 55.25: la escala de velocidad queda corta y
++// el "sobrepasar velocidad" (la estela de viento al picar) no llega a dispararse nunca.
++void Mgr::FijarVelocidadDeVuelo(Unit* objetivo, bool dinamico)
++{
++    if (!objetivo || !Habilitado())
++        return;
++
++    ObjectGuid guid = objetivo->GetGUID();
++
++    if (dinamico)
++    {
++        auto it = _velocidadDeVuelo.find(guid);
++        if (it == _velocidadDeVuelo.end())
++            _velocidadDeVuelo[guid] = objetivo->GetSpeedRate(MOVE_FLIGHT);
++
++        objetivo->SetSpeed(MOVE_FLIGHT, VelocidadDinamica());
++        TC_LOG_DEBUG("scripts.vuelo", "vuelo dinamico: {} velocidad de vuelo a {} (retail: 29.4)",
++            objetivo->GetName(), objetivo->GetSpeed(MOVE_FLIGHT));
++        return;
++    }
++
++    auto it = _velocidadDeVuelo.find(guid);
++    if (it == _velocidadDeVuelo.end())
++        return;
++
++    objetivo->SetSpeed(MOVE_FLIGHT, it->second);
++    TC_LOG_DEBUG("scripts.vuelo", "vuelo dinamico: {} velocidad de vuelo restaurada a {}",
++        objetivo->GetName(), objetivo->GetSpeed(MOVE_FLIGHT));
++    _velocidadDeVuelo.erase(it);
++}
++
++Modo Mgr::ModoPorDefecto() const
++{
++    std::string modo = Config("modo_por_defecto", "cielonautica");
++    return modo == "estable" ? Modo::Estable : Modo::Cielonautica;
++}
++
++Impulso const* Mgr::GetImpulso(uint32 hechizo) const
++{
++    auto it = _impulsos.find(hechizo);
++    return it == _impulsos.end() ? nullptr : &it->second;
++}
++
++// ----------------------------------------------------------------------------
++// el estado de vuelo
++// ----------------------------------------------------------------------------
++bool Mgr::CumpleRequisito(Player* jugador) const
++{
++    // Sin filas en vuelo_requisito no se exige nada (servidor de pruebas).
++    if (_requisitos.empty())
++        return true;
++
++    for (uint32 hechizo : _requisitos)
++        if (jugador->HasSpell(hechizo))
++            return true;
++
++    return false;
++}
++
++Modo Mgr::ModoDe(Player* jugador) const
++{
++    if (!jugador)
++        return Modo::Ninguno;
++
++    if (jugador->HasAura(AuraEstable()))
++        return Modo::Estable;
++    if (jugador->HasAura(AuraCielonautica()))
++        return Modo::Cielonautica;
++
++    return Modo::Ninguno;
++}
++
++bool Mgr::CapacidadEsVoladora(uint32 capacidadMontura) const
++{
++    // La capacidad que trae el propio hechizo de la montura dice si vuela.
++    if (MountCapabilityEntry const* capacidad = sMountCapabilityStore.LookupEntry(capacidadMontura))
++        return (capacidad->Flags & MOUNT_CAPABILITY_FLAG_FLYING) != 0;
++
++    // Montura sin capacidad declarada: manda la config (0 = se queda de tierra)
++    return ConfigNumero("volar_con_cualquier_montura", 0) != 0;
++}
++
++ReglaZona Mgr::ReglaDeZona(Player* jugador) const
++{
++    if (!jugador || _zonas.empty())
++        return ReglaZona::Todo;
++
++    // Se mira la zona del jugador y sus padres: una regla puesta en "Khaz Algar" alcanza a
++    // todas sus sub-zonas, asi una fila cubre la region entera.
++    for (uint32 areaId = jugador->GetAreaId(); areaId;)
++    {
++        auto it = _zonas.find(areaId);
++        if (it != _zonas.end())
++            return it->second.Regla;
++
++        AreaTableEntry const* area = sAreaTableStore.LookupEntry(areaId);
++        if (!area || int32(area->ParentAreaID) == int32(areaId) || area->ParentAreaID == 0)
++            break;
++
++        areaId = uint32(area->ParentAreaID);
++    }
++
++    return ReglaZona::Todo;
++}
++
++void Mgr::AplicarAlMontar(Unit* objetivo, uint32 capacidadMontura)
++{
++    if (!objetivo || !Habilitado())
++        return;
++
++    Player* jugador = objetivo->ToPlayer();
++    if (!jugador)
++        return;
++
++    // La montura vuela (setCanFly) para cualquiera que tenga la equitacion que declare la base.
++    if (!CumpleRequisito(jugador))
++        return;
++
++    // Montura de tierra: no se le enciende el vuelo. Lo decide la capacidad del hechizo, no el
++    // nombre de la montura (asi un caballo no sale volando).
++    if (!CapacidadEsVoladora(capacidadMontura))
++    {
++        TC_LOG_DEBUG("scripts.vuelo", "vuelo dinamico: {} monta una montura de tierra (capacidad {}): sin vuelo",
++            jugador->GetName(), capacidadMontura);
++        return;
++    }
++
++    // La zona puede prohibir el vuelo por completo o dejar solo el estatico.
++    ReglaZona regla = ReglaDeZona(jugador);
++    if (regla == ReglaZona::Nada)
++    {
++        TC_LOG_DEBUG("scripts.vuelo", "vuelo dinamico: {} monta pero la zona {} no permite volar",
++            jugador->GetName(), jugador->GetAreaId());
++        return;
++    }
++
++    objetivo->SetCanFly(true);
++
++    bool dinamico = ModoDe(jugador) != Modo::Estable && regla != ReglaZona::Estable;
++
++    if (!dinamico)
++    {
++        // Vuelo estable: sin inercia, sin doble salto y sin vigor (las capacidades 455/456/457
++        // del cliente exigen justamente esta aura para el vuelo estatico).
++        objetivo->SetCanAdvFly(false);
++        objetivo->SetCanDoubleJump(false);
++        objetivo->RemoveAura(AuraVigor());
++        FijarVelocidadDeVuelo(objetivo, false);
++        FijarRecorteAero(objetivo, false);
++        TC_LOG_DEBUG("scripts.vuelo", "vuelo dinamico: {} monta en modo estable (zona {})",
++            jugador->GetName(), jugador->GetAreaId());
++        return;
++    }
++
++    // Cielonautica: el paquete de parametros de vuelo (los 13 SMSG_MOVE_SET_ADV_FLYING_*) sale de
++    // SetFlightCapabilityID, y el Vigor es lo que habilita las habilidades activas en el cliente.
++    objetivo->SetCanAdvFly(true);
++    objetivo->SetCanDoubleJump(true);
++    objetivo->SetFlightCapabilityID(int32(CapVueloDinamico()), true);
++    FijarVelocidadDeVuelo(objetivo, true);
++    FijarRecorteAero(objetivo, true);
++
++    if (!jugador->HasAura(AuraVigor()))
++        jugador->CastSpell(jugador, AuraVigor(), true);
++
++    TC_LOG_DEBUG("scripts.vuelo", "vuelo dinamico: {} monta en cielonautica (cap {}, zona {})",
++        jugador->GetName(), CapVueloDinamico(), jugador->GetAreaId());
++}
++
++void Mgr::FijarReglaDeZona(uint32 areaId, ReglaZona regla, std::string const& nota)
++{
++    if (!areaId)
++        return;
++
++    // Se aplica ya en memoria (el comando tiene que verse al instante) y se persiste en la tabla.
++    if (regla == ReglaZona::Todo)
++    {
++        _zonas.erase(areaId);
++        WorldDatabase.PExecute("DELETE FROM vuelo_zona WHERE area_id = {}", areaId);
++
++        TC_LOG_INFO("scripts.vuelo", "vuelo dinamico: zona {} vuelve al vuelo normal (sin regla)", areaId);
++        return;
++    }
++
++    Zona zona;
++    zona.AreaId = areaId;
++    zona.Regla = regla;
++    zona.Nota = nota;
++    _zonas[areaId] = zona;
++
++    char const* texto = regla == ReglaZona::Estable ? "estable" : "nada";
++
++    WorldDatabase.PExecute(
++        "INSERT INTO vuelo_zona (area_id, permite, nota) VALUES ({}, '{}', '{}') "
++        "ON DUPLICATE KEY UPDATE permite = VALUES(permite), nota = VALUES(nota)",
++        areaId, texto, nota);
++
++    TC_LOG_INFO("scripts.vuelo", "vuelo dinamico: zona {} queda en '{}' ({})", areaId, texto, nota);
++}
++
++void Mgr::FijarVelocidadImpulso(TipoImpulso tipo, float velocidad)
++{
++    char const* texto = tipo == TipoImpulso::Ascenso ? "ascenso" : tipo == TipoImpulso::Giro ? "giro" : "avance";
++
++    // Se cambia toda la familia de una vez (los hechizos de la barra son copias del mismo).
++    uint32 tocados = 0;
++    for (auto& [hechizo, impulso] : _impulsos)
++        if (impulso.Tipo == tipo)
++        {
++            impulso.Velocidad = velocidad;
++            ++tocados;
++        }
++
++    WorldDatabase.PExecute("UPDATE vuelo_impulso SET velocidad = {} WHERE tipo = '{}'", velocidad, texto);
++
++    TC_LOG_INFO("scripts.vuelo", "vuelo dinamico: impulsos de tipo {} -> velocidad {} ({} hechizos)",
++        texto, velocidad, tocados);
++}
++
++void Mgr::AplicarReglaDeZona(Player* jugador, uint32 areaNueva)
++{
++    if (!jugador || !Habilitado() || _zonas.empty())
++        return;
++
++    // Sin montura no hay estado que ajustar: la regla se aplica al montar.
++    if (!jugador->IsMounted())
++        return;
++
++    ReglaZona regla = ReglaDeZona(jugador);
++
++    if (regla == ReglaZona::Todo)
++    {
++        // Saliendo de una zona restringida: se le devuelve el vuelo que pide su estilo.
++        if (ModoDe(jugador) != Modo::Estable)
++        {
++            jugador->SetCanFly(true);
++            jugador->SetCanAdvFly(true);
++            jugador->SetCanDoubleJump(true);
++            jugador->SetFlightCapabilityID(int32(CapVueloDinamico()), true);
++            FijarRecorteAero(jugador, true);
++            if (!jugador->HasAura(AuraVigor()))
++                jugador->CastSpell(jugador, AuraVigor(), true);
++        }
++
++        return;
++    }
++
++    if (regla == ReglaZona::Estable)
++    {
++        jugador->SetCanFly(true);
++        jugador->SetCanAdvFly(false);
++        jugador->SetCanDoubleJump(false);
++        jugador->RemoveAura(AuraVigor());
++        FijarRecorteAero(jugador, false);
++    }
++    else // Nada
++    {
++        jugador->SetCanAdvFly(false);
++        jugador->SetCanDoubleJump(false);
++        jugador->RemoveAura(AuraVigor());
++        FijarRecorteAero(jugador, false);
++        jugador->SetCanFly(false);
++    }
++
++    TC_LOG_INFO("scripts.vuelo", "vuelo dinamico: {} entra a la zona {} (area {}) y la montura queda en {}",
++        jugador->GetName(), areaNueva, jugador->GetAreaId(),
++        regla == ReglaZona::Nada ? "modo tierra" : "vuelo estable");
++}
++
++void Mgr::AplicarAlDesmontar(Unit* objetivo)
++{
++    if (!objetivo || !Habilitado())
++        return;
++
++    objetivo->RemoveAura(AuraVigor());
++    objetivo->SetCanAdvFly(false);
++    objetivo->SetCanDoubleJump(false);
++    FijarVelocidadDeVuelo(objetivo, false);
++    FijarRecorteAero(objetivo, false);
++
++    // No le apagues el vuelo si otra aura se lo esta dando (levitacion, formas de vuelo, etc.)
++    if (!objetivo->HasAuraType(SPELL_AURA_FLY) && !objetivo->HasAuraType(SPELL_AURA_MOUNTED))
++        objetivo->SetCanFly(false);
++}
++
++void Mgr::PonerAlDia(Player* jugador)
++{
++    if (!jugador || !Habilitado())
++        return;
++
++    if (jugador->GetLevel() < NivelMinimo())
++        return;
++
++    // 1) aprender lo que falte (el nivel de cada habilidad lo dice la base)
++    for (Habilidad const& habilidad : _habilidades)
++    {
++        if (habilidad.NivelMinimo > jugador->GetLevel() || jugador->HasSpell(habilidad.Hechizo))
++            continue;
++
++        jugador->LearnSpell(habilidad.Hechizo, false);
++        TC_LOG_INFO("scripts.vuelo", "vuelo dinamico: {} aprende {} ({})",
++            jugador->GetName(), habilidad.Hechizo, habilidad.Nota);
++    }
++
++    // 2) el modo de vuelo. El core deja el modo ESTABLE en cada login (Player::_LoadAuras hace
++    //    AddAura(404468)), asi que si el servidor dice cielonautica hay que darlo vuelta.
++    Modo porDefecto = ModoPorDefecto();
++    bool tieneCielo = jugador->HasAura(AuraCielonautica());
++    bool tieneEstable = jugador->HasAura(AuraEstable());
++
++    if (tieneCielo && tieneEstable)
++    {
++        if (porDefecto == Modo::Estable)
++        {
++            jugador->RemoveAura(AuraCielonautica());
++            tieneCielo = false;
++        }
++        else
++        {
++            jugador->RemoveAura(AuraEstable());
++            tieneEstable = false;
++        }
++    }
++
++    if (porDefecto == Modo::Cielonautica && !tieneCielo)
++    {
++        if (tieneEstable)
++            jugador->RemoveAura(AuraEstable());
++
++        jugador->CastSpell(jugador, AuraCielonautica(), true);
++        tieneCielo = true;
++        tieneEstable = false;
++    }
++    else if (porDefecto == Modo::Estable && !tieneEstable)
++    {
++        if (tieneCielo)
++            jugador->RemoveAura(AuraCielonautica());
++
++        jugador->CastSpell(jugador, AuraEstable(), true);
++        tieneEstable = true;
++        tieneCielo = false;
++    }
++
++    // 3) el Vigor acompaña al modo: sin el, el cliente no deja castear las habilidades activas
++    //    (SpellAuraRestrictions: CasterAuraSpell = 372773).
++    if (tieneCielo && !jugador->HasAura(AuraVigor()))
++        jugador->CastSpell(jugador, AuraVigor(), true);
++    else if (tieneEstable && jugador->HasAura(AuraVigor()))
++        jugador->RemoveAura(AuraVigor());
++}
++
++std::string Mgr::EstadoJugador(Player* jugador) const
++{
++    if (!jugador)
++        return "sin personaje";
++
++    Modo modo = ModoDe(jugador);
++
++    std::string texto = Trinity::StringFormat("{} | nivel {} | mapa {} | area {} | montado: {} | cap {} | estilo {}",
++        jugador->GetName(), jugador->GetLevel(), jugador->GetMapId(), jugador->GetAreaId(),
++        jugador->IsMounted() ? "si" : "no", jugador->GetFlightCapabilityID(),
++        modo == Modo::Cielonautica ? "cielonautica" : modo == Modo::Estable ? "estable" : "ninguno");
++
++    texto += Trinity::StringFormat("\n  auras: vigor {} | cielonautica {} | estable {}",
++        jugador->HasAura(AuraVigor()) ? "si" : "no",
++        jugador->HasAura(AuraCielonautica()) ? "si" : "no",
++        jugador->HasAura(AuraEstable()) ? "si" : "no");
++
++    texto += Trinity::StringFormat("\n  flags: VOLANDO {} | PUEDE_VOLAR {} | PUEDE_DINAMICO {} | MODO_DINAMICO {} | DOBLE_SALTO {}",
++        jugador->HasUnitMovementFlag(MOVEMENTFLAG_FLYING) ? "si" : "no",
++        jugador->HasUnitMovementFlag(MOVEMENTFLAG_CAN_FLY) ? "si" : "no",
++        jugador->HasUnitMovementFlag(MOVEMENTFLAG_CAN_ADV_FLY) ? "si" : "no",
++        jugador->HasUnitMovementFlag(MOVEMENTFLAG_ADV_FLYING) ? "si" : "no",
++        jugador->HasUnitMovementFlag(MOVEMENTFLAG_CAN_DOUBLE_JUMP) ? "si" : "no");
++
++    // MODO_DINAMICO lo pone el CLIENTE (el servidor solo da permiso con PUEDE_DINAMICO). Y si esta
++    // en ese modo, el cliente manda en su movimiento la velocidad de avance y de subida.
++    if (jugador->m_movementInfo.advFlying)
++        texto += Trinity::StringFormat("\n  el cliente SI reporta vuelo dinamico (avance {:.2f} | subida {:.2f})",
++            jugador->m_movementInfo.advFlying->forwardVelocity, jugador->m_movementInfo.advFlying->upVelocity);
++    else
++        texto += "\n  el cliente NO reporta vuelo dinamico (AdvFlying ausente): esta volando en el modelo viejo";
++
++    return texto;
++}
++
++bool Mgr::AlternarModo(Player* jugador)
++{
++    if (!jugador || !Habilitado())
++        return false;
++
++    bool estabaEnCielonautica = ModoDe(jugador) == Modo::Cielonautica;
++
++    jugador->RemoveAura(AuraCielonautica());
++    jugador->RemoveAura(AuraEstable());
++
++    if (estabaEnCielonautica)
++    {
++        jugador->CastSpell(jugador, AuraEstable(), true);
++        jugador->RemoveAura(AuraVigor());
++
++        if (jugador->IsMounted())
++        {
++            jugador->SetCanAdvFly(false);
++            jugador->SetCanDoubleJump(false);
++            FijarVelocidadDeVuelo(jugador, false);
++            FijarRecorteAero(jugador, false);
++        }
++
++        TC_LOG_INFO("scripts.vuelo", "vuelo dinamico: {} pasa a vuelo ESTABLE", jugador->GetName());
++        return true;
++    }
++
++    jugador->CastSpell(jugador, AuraCielonautica(), true);
++
++    if (!jugador->HasAura(AuraVigor()))
++        jugador->CastSpell(jugador, AuraVigor(), true);
++
++    if (jugador->IsMounted())
++    {
++        jugador->SetCanFly(true);
++        jugador->SetCanAdvFly(true);
++        jugador->SetCanDoubleJump(true);
++        jugador->SetFlightCapabilityID(int32(CapVueloDinamico()), true);
++        FijarVelocidadDeVuelo(jugador, true);
++        FijarRecorteAero(jugador, true);
++    }
++
++    TC_LOG_INFO("scripts.vuelo", "vuelo dinamico: {} pasa a CIELONAUTICA", jugador->GetName());
++    return true;
++}
++
++// Un empujon hacia donde mira el draco, con su inclinacion (pitch). Lo usan avance, giro y el
++// tren del ascenso (en retail los tres apuntan igual: la direccion actual del vuelo).
++void Mgr::EmpujarHaciaDondeVuela(Player* jugador, float velocidad)
++{
++    if (!jugador || velocidad <= 0.0f)
++        return;
++
++    float orientacion = jugador->GetOrientation();
++    float inclinacion = jugador->m_movementInfo.pitch;
++
++    float x = velocidad * std::cos(orientacion) * std::cos(inclinacion);
++    float y = velocidad * std::sin(orientacion) * std::cos(inclinacion);
++    float z = velocidad * std::sin(inclinacion);
++
++    jugador->AddMoveImpulse(Position(x, y, z));
++
++    TC_LOG_DEBUG("scripts.vuelo", "vuelo dinamico: {} empujon (velocidad {} -> {:.1f},{:.1f},{:.1f})",
++        jugador->GetName(), velocidad, x, y, z);
++}
++
++// El recorte del techo aero del modo. Retail, con el vuelo dinamico encendido, no manda la fila del
++// DB2 tal cual: manda MaxVel e impulsoMax al 85% y los devuelve enteros al apagarlo.
++void Mgr::FijarRecorteAero(Unit* objetivo, bool dinamico)
++{
++    if (!objetivo || !Habilitado())
++        return;
++
++    objetivo->SetAdvFlyingSpeedModifier(dinamico ? FactorVelocidadMax() : 1.0f,
++        dinamico ? FactorImpulsoMax() : 1.0f, true);
++
++    // INFO porque es la evidencia de la prueba en vivo: los dos valores que el cliente acaba de
++    // recibir (retail con el modo encendido: 55.25 de 65 y 85 de 100).
++    TC_LOG_INFO("scripts.vuelo", "vuelo dinamico: {} recorte aero {} -> velocidad max {} | impulso max {}",
++        objetivo->GetName(), dinamico ? "PUESTO" : "SACADO",
++        objetivo->GetAdvFlyingSpeed(ADV_FLYING_MAX_VEL),
++        objetivo->GetAdvFlyingSpeed(ADV_FLYING_ADD_IMPULSE_MAX_SPEED));
++}
++
++void Mgr::EnviarImpulso(Player* jugador, uint32 hechizo)
++{
++    Impulso const* impulso = GetImpulso(hechizo);
++    if (!jugador || !impulso)
++        return;
++
++    float velocidad = impulso->Velocidad;
++    if (velocidad <= 0.0f)
++        return;
++
++    if (impulso->Tipo == TipoImpulso::Ascenso)
++    {
++        // FASE 1: el empujon vertical (retail: 45 hacia arriba, en el mismo paquete que el aura
++        // 392752 "Potenciacion de lanzamiento").
++        jugador->AddMoveImpulse(Position(0.0f, 0.0f, velocidad));
++
++        // FASE 2: el tren de empujes suaves hacia donde vuela el draco.
++        uint32 empujes = TrenAscensoEmpujes();
++        if (empujes > 0)
++            jugador->m_Events.AddEvent(new EventoTrenAscenso(jugador->GetGUID(), empujes),
++                Milliseconds(TrenAscensoRetrasoMs()));
++
++        // Una sola linea (INFO, no DEBUG): es la evidencia de la prueba en vivo, y el canal
++        // `scripts.vuelo` ya se usa para esto (montar, cambio de modo). Cada empujon va en DEBUG.
++        TC_LOG_INFO("scripts.vuelo", "vuelo dinamico: {} ascenso {} -> fase 1 {} vertical + fase 2 {} empujes de {} cada {} ms (+{} ms)",
++            jugador->GetName(), hechizo, velocidad, empujes, TrenAscensoVelocidad(),
++            TrenAscensoIntervaloMs(), TrenAscensoRetrasoMs());
++
++        return;
++    }
++
++    // Avance y giro empujan hacia donde mira el draco, con su inclinacion (pitch).
++    EmpujarHaciaDondeVuela(jugador, velocidad);
++    TC_LOG_DEBUG("scripts.vuelo", "vuelo dinamico: {} {} {} (velocidad {})",
++        jugador->GetName(), impulso->Tipo == TipoImpulso::Giro ? "giro" : "avance", hechizo, velocidad);
++}
++
++std::string Mgr::EstadoTexto() const
++{
++    std::string texto = Trinity::StringFormat(
++        "vuelo dinamico: {} | nivel minimo {} | modo por defecto {} | cap {} | vigor {} | cielonautica {} | estable {}",
++        Habilitado() ? "ENCENDIDO" : "APAGADO", NivelMinimo(),
++        ModoPorDefecto() == Modo::Estable ? "estable" : "cielonautica", CapVueloDinamico(),
++        AuraVigor(), AuraCielonautica(), AuraEstable());
++
++    texto += Trinity::StringFormat("\n  habilidades que aprende solo: {} | requisitos de equitacion: {} | impulsos: {} | zonas con regla: {}",
++        _habilidades.size(), _requisitos.size(), _impulsos.size(), _zonas.size());
++
++    for (Habilidad const& habilidad : _habilidades)
++        texto += Trinity::StringFormat("\n   - {} desde nivel {} ({})", habilidad.Hechizo, habilidad.NivelMinimo, habilidad.Nota);
++
++    for (auto const& [hechizo, impulso] : _impulsos)
++        texto += Trinity::StringFormat("\n   - impulso {} ({}) velocidad {}", hechizo,
++            impulso.Tipo == TipoImpulso::Ascenso ? "ascenso" : impulso.Tipo == TipoImpulso::Giro ? "giro" : "avance",
++            impulso.Velocidad);
++
++    texto += Trinity::StringFormat("\n  tren del ascenso (fase 2): {} empujes de {} cada {} ms, +{} ms | recorte aero del modo: x{} velocidad max, x{} impulso max",
++        TrenAscensoEmpujes(), TrenAscensoVelocidad(), TrenAscensoIntervaloMs(), TrenAscensoRetrasoMs(),
++        FactorVelocidadMax(), FactorImpulsoMax());
++
++    for (auto const& [areaId, zona] : _zonas)
++        texto += Trinity::StringFormat("\n   - zona {}: {}", areaId,
++            zona.Regla == ReglaZona::Nada ? "no se vuela" : zona.Regla == ReglaZona::Estable ? "solo vuelo estable" : "vuelo normal");
++
++    return texto;
++}
++} // namespace VueloDinamico
++} // namespace Trinity
+diff --git a/src/server/game/VueloDinamico/VueloDinamicoMgr.h b/src/server/game/VueloDinamico/VueloDinamicoMgr.h
+new file mode 100644
+index 0000000000..47fd2c8987
+--- /dev/null
++++ b/src/server/game/VueloDinamico/VueloDinamicoMgr.h
+@@ -0,0 +1,209 @@
++/*
++ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * ============================================================================
++ *  VueloDinamicoMgr - el vuelo dinamico (skyriding) propio
++ * ============================================================================
++ *
++ *  POR QUE EXISTE ESTE ARCHIVO
++ *  El core ya trae media pieza: los 13 SMSG_MOVE_SET_ADV_FLYING_*, el campo de
++ *  update FlightCapabilityID (Unit.cpp, SetFlightCapabilityID) y los flags
++ *  SetCanAdvFly / SetCanDoubleJump. Lo que NO trae es quien los encienda, y hay
++ *  una pieza que solo se ve mirando los datos del CLIENTE:
++ *
++ *    En SpellAuraRestrictions.db2 hay 23 filas con CasterAuraSpell = 372773
++ *    (Vigor) que gatean 372608 "Impulso de avance", 372610 "Ascenso al cielo",
++ *    361584 "Aceleracion giratoria" y el widget de la barra de vigor (423624).
++ *    Sin esa aura el cliente rechaza el casteo ("todavia no aprendido") ANTES de
++ *    mandar un paquete, asi que del lado del servidor no se ve ningun error.
++ *
++ *  Segunda pieza: el core fuerza el modo vuelo estable en cada login
++ *  (Player::_LoadAuras hace AddAura(404468)) y las capacidades de montura de
++ *  vuelo estatico exigen justamente esa aura (MountCapability 455/456/457 con
++ *  ReqSpellAuraID = 404468). Por eso un servidor sin tocar vuela "estable" y
++ *  nunca dragonriding: la capacidad dinamica (494, FlightCapabilityID 11) exige
++ *  saber 376777 "Cielonautica basica" y ademas no estar en modo estable.
++ *  Este archivo NO toca Player.cpp: ordena el modo al entrar al mundo.
++ *
++ *  TERCERA pieza, la que hace que se sienta: las habilidades activas empujan al
++ *  jugador (SMSG_MOVE_ADD_IMPULSE), que hasta ahora estaba como STATUS_UNHANDLED.
++ *
++ *  Regla de diseno (la misma del sistema de miticas): TODO lo configurable sale
++ *  de la base. Las tablas `vuelo_*` mandan; este codigo solo las interpreta.
++ *  Cambiar un hechizo, un nivel, una velocidad o un umbral es un INSERT.
++ * ============================================================================
++ */
++
++#ifndef VueloDinamicoMgr_h__
++#define VueloDinamicoMgr_h__
++
++#include "Define.h"
++
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++class Player;
++class Unit;
++
++namespace Trinity
++{
++namespace VueloDinamico
++{
++// Los dos estilos de vuelo del cliente (auras 404464 y 404468).
++enum class Modo : uint8
++{
++    Ninguno = 0,
++    Cielonautica,   // skyriding: inercia, vigor, habilidades activas
++    Estable         // vuelo estatico de siempre: hover y velocidad constante
++};
++
++// Como empuja cada habilidad activa.
++enum class TipoImpulso : uint8
++{
++    Ascenso = 0,    // hacia arriba (Ascenso al cielo)
++    Avance,         // hacia donde mira el draco (Impulso de avance)
++    Giro            // igual que avance, pero mas fuerte (Aceleracion giratoria)
++};
++
++// Que deja hacer el vuelo en una zona (world.vuelo_zona). Sin fila = Todo.
++enum class ReglaZona : uint8
++{
++    Todo = 0,       // vuelo normal (dinamico o estable, el que tenga puesto)
++    Estable,        // solo vuelo estatico en esa zona (se apaga el dinamico)
++    Nada            // no vuela: la montura queda de tierra
++};
++
++// Una habilidad que el sistema aprende solo (world.vuelo_habilidad)
++struct Habilidad
++{
++    uint32 Hechizo = 0;
++    uint32 NivelMinimo = 1;
++    std::string Nota;
++};
++
++// Una zona con regla propia (world.vuelo_zona)
++struct Zona
++{
++    uint32 AreaId = 0;
++    ReglaZona Regla = ReglaZona::Todo;
++    std::string Nota;
++};
++
++// Un empujon de vuelo (world.vuelo_impulso)
++struct Impulso
++{
++    uint32 Hechizo = 0;
++    TipoImpulso Tipo = TipoImpulso::Avance;
++    float Velocidad = 0.0f;
++    std::string Nota;
++};
++
++class Mgr
++{
++public:
++    static Mgr* instance();
++
++    // --- configuracion (world.vuelo_*) ---
++    void CargarConfig();
++    std::string Config(std::string const& clave, std::string const& porDefecto = "") const;
++    uint32 ConfigNumero(std::string const& clave, uint32 porDefecto) const;
++    float ConfigFlotante(std::string const& clave, float porDefecto) const;
++
++    // Velocidad de vuelo dinamico. Retail manda SMSG_MOVE_SET_FLIGHT_SPEED 29.4 (= 420% de la
++    // base de vuelo 7.0) en el mismo instante en que activa el modo (SMSG_MOVE_SET_CAN_ADV_FLY,
++    // sniff 12.1.0.69875 del 21-sep-2026) y 7.7 al salir. TC trae la base de vuelo en 7.0, asi
++    // que la tasa que produce 29.4 es 4.2. Al salir se RESTAURA la tasa que tenia antes, sin
++    // inventar un valor propio (cada montura/aura de vuelo trae la suya).
++    float VelocidadDinamica() const { return ConfigFlotante("velocidad_dinamica", 4.2f); }
++    void FijarVelocidadDeVuelo(Unit* objetivo, bool dinamico);
++
++    // El tren de empujes del ascenso (la fase 2 de retail, sniff 21-sep-2026): despues del empujon
++    // vertical de 45, un tren de empujes suaves hacia donde vuela el draco. Medido: 5-6 empujes de
++    // 5.0 cada 102 ms, arrancando 0.71 s despues del 45. 0 empujes = sin tren.
++    uint32 TrenAscensoEmpujes() const { return ConfigNumero("tren_ascenso_empujes", 6); }
++    uint32 TrenAscensoRetrasoMs() const { return ConfigNumero("tren_ascenso_retraso_ms", 700); }
++    uint32 TrenAscensoIntervaloMs() const { return ConfigNumero("tren_ascenso_intervalo_ms", 100); }
++    float TrenAscensoVelocidad() const { return ConfigFlotante("tren_ascenso_velocidad", 5.0f); }
++    // El recorte del techo aero con el modo dinamico encendido (retail: 0.85 = 55.25 y 85).
++    float FactorVelocidadMax() const { return ConfigFlotante("factor_velocidad_max", 0.85f); }
++    float FactorImpulsoMax() const { return ConfigFlotante("factor_impulso_max", 0.85f); }
++
++    bool Habilitado() const { return ConfigNumero("habilitado", 1) != 0; }
++    uint32 NivelMinimo() const { return ConfigNumero("nivel_minimo", 10); }
++    uint32 AuraVigor() const { return ConfigNumero("aura_vigor", 372773); }
++    uint32 AuraCielonautica() const { return ConfigNumero("aura_cielonautica", 404464); }
++    uint32 AuraEstable() const { return ConfigNumero("aura_estable", 404468); }
++    uint32 CapVueloDinamico() const { return ConfigNumero("cap_vuelo_dinamico", 1); }
++    Modo ModoPorDefecto() const;
++
++    std::vector<Habilidad> const& GetHabilidades() const { return _habilidades; }
++    Impulso const* GetImpulso(uint32 hechizo) const;
++    bool HayRequisitoEquitacion() const { return !_requisitos.empty(); }
++    std::unordered_map<uint32, Zona> const& GetZonas() const { return _zonas; }
++    // La regla de la zona donde esta el jugador (mira tambien las zonas padre).
++    ReglaZona ReglaDeZona(Player* jugador) const;
++    // La capacidad de montura que trae el hechizo dice si esa montura vuela.
++    bool CapacidadEsVoladora(uint32 capacidadMontura) const;
++
++    // --- lo que hace el sistema ---
++    // Engancha el estado de vuelo al montar/desmontar (lo llama HandleAuraMounted).
++    void AplicarAlMontar(Unit* objetivo, uint32 capacidadMontura);
++    void AplicarAlDesmontar(Unit* objetivo);
++    // Al entrar al mundo o subir de nivel: aprende lo que falte y deja modo y Vigor coherentes.
++    void PonerAlDia(Player* jugador);
++    // Al cambiar de zona: si la zona tiene regla propia, deja la montura como corresponde.
++    void AplicarReglaDeZona(Player* jugador, uint32 areaNueva);
++    // Guarda una regla de zona: la aplica en memoria ya y la persiste en world.vuelo_zona.
++    void FijarReglaDeZona(uint32 areaId, ReglaZona regla, std::string const& nota);
++    // Cambia la velocidad de toda una familia de impulsos (ascenso / avance / giro) en vivo y la
++    // persiste en world.vuelo_impulso. Para calibrar a mano, sin recompilar.
++    void FijarVelocidadImpulso(TipoImpulso tipo, float velocidad);
++    // El estilo de vuelo que tiene puesto ahora mismo.
++    Modo ModoDe(Player* jugador) const;
++    // Radiografia de un jugador para diagnosticar en vivo (lo que imprime `.vuelo pj`): montura,
++    // auras, flags de movimiento y lo que el cliente reporta de vuelo dinamico (AdvFlying).
++    std::string EstadoJugador(Player* jugador) const;
++    // Alterna el estilo (lo que dispara el hechizo "Cambiar estilo de vuelo").
++    bool AlternarModo(Player* jugador);
++    // Empuja al jugador segun la habilidad activa que haya casteado.
++    void EnviarImpulso(Player* jugador, uint32 hechizo);
++    // Un empujon hacia donde vuela el draco (lo usan avance, giro y el tren del ascenso).
++    void EmpujarHaciaDondeVuela(Player* jugador, float velocidad);
++    // Recorte del techo aero del modo: lo pone al montar en cielonautica y lo saca al salir.
++    void FijarRecorteAero(Unit* objetivo, bool dinamico);
++    // Texto de `.vuelo estado` (lo que mando a la pantalla del GM).
++    std::string EstadoTexto() const;
++
++private:
++    // El jugador cumple el requisito de equitacion (world.vuelo_requisito).
++    bool CumpleRequisito(Player* jugador) const;
++
++    std::unordered_map<std::string, std::string> _config;
++    std::vector<Habilidad> _habilidades;
++    std::vector<uint32> _requisitos;
++    std::unordered_map<uint32, Impulso> _impulsos;
++    std::unordered_map<ObjectGuid, float> _velocidadDeVuelo;  // tasa de vuelo previa, para restaurarla al salir del modo dinamico
++    std::unordered_map<uint32, Zona> _zonas;
++};
++} // namespace VueloDinamico
++} // namespace Trinity
++
++#define sVueloDinamico Trinity::VueloDinamico::Mgr::instance()
++
++#endif // VueloDinamicoMgr_h__
+diff --git a/src/server/scripts/Custom/vuelo_dinamico_custom.cpp b/src/server/scripts/Custom/vuelo_dinamico_custom.cpp
+new file mode 100644
+index 0000000000..9770523111
+--- /dev/null
++++ b/src/server/scripts/Custom/vuelo_dinamico_custom.cpp
+@@ -0,0 +1,438 @@
++/*
++ * ============================================================================
++ *  vuelo_dinamico_custom.cpp - VUELO DINAMICO (skyriding): los enganches del juego
++ * ============================================================================
++ *
++ *  POR QUE EXISTE ESTE ARCHIVO
++ *  El motor (que decide y guarda) es VueloDinamicoMgr; esto es lo que el cliente
++ *  y el jugador tocan:
++ *
++ *   - AL ENTRAR AL MUNDO y al subir de nivel: aprende las habilidades que declare
++ *     world.vuelo_habilidad y deja el estilo de vuelo y el Vigor coherentes. Esto
++ *     es lo que deshace el modo ESTABLE que el core fuerza en cada login.
++ *   - EL HECHIZO DE ALTERNAR ESTILO ("Cambiar estilo de vuelo"): cambia entre
++ *     cielonautica (inercia) y estable. Se registra para TODAS las copias del
++ *     hechizo que trae este build del cliente, porque la barra la maneja el cliente:
++ *       404471 | 436854 | 459987 | 459988 | 460002   (world.vuelo_toggle)
++ *   - LAS HABILIDADES ACTIVAS (Ascenso al cielo, Impulso de avance, Aceleracion
++ *     giratoria): empujan al jugador con SMSG_MOVE_ADD_IMPULSE. La velocidad y el
++ *     tipo de cada una salen de world.vuelo_impulso (nada quemado).
++ *   - LOS COMANDOS de operacion: `.vuelo estado | recargar | ensenar <pj> | modo <pj> [estilo]`.
++ *
++ *  OJO, la mina que costo encontrar: el cliente NO manda el casteo de las
++ *  habilidades activas si no tiene el aura Vigor (372773). En SpellAuraRestrictions
++ *  hay 23 filas con CasterAuraSpell = 372773 que gatean esos hechizos, asi que sin
++ *  el aura el jugador solo ve "todavia no aprendido" y en el log del servidor no
++ *  aparece nada. El modo cielonautica mantiene el Vigor puesto.
++ * ============================================================================
++ */
++
++#include "Cache/CharacterCache.h"
++#include "Chat.h"
++#include "ChatCommand.h"
++#include "DatabaseEnv.h"
++#include "Log.h"
++#include "ObjectAccessor.h"
++#include "Player.h"
++#include "RBAC.h"
++#include "ScriptMgr.h"
++#include "SpellScript.h"
++#include "StringFormat.h"
++#include "VueloDinamicoMgr.h"
++
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++using namespace Trinity::ChatCommands;
++
++namespace
++{
++// ----------------------------------------------------------------------------
++// los enganches de juego
++// ----------------------------------------------------------------------------
++class script_vuelo_jugador : public PlayerScript
++{
++public:
++    script_vuelo_jugador() : PlayerScript("script_vuelo_jugador") { }
++
++    void OnLogin(Player* jugador, bool /*primerIngreso*/) override
++    {
++        sVueloDinamico->PonerAlDia(jugador);
++    }
++
++    void OnLevelChanged(Player* jugador, uint8 /*nivelViejo*/) override
++    {
++        sVueloDinamico->PonerAlDia(jugador);
++    }
++
++    // Al cambiar de zona: si la zona tiene regla propia (world.vuelo_zona) y el jugador va montado,
++    // se le ajusta el vuelo ahi mismo (una zona que no vuela baja al draco al piso).
++    void OnUpdateZone(Player* jugador, uint32 /*zonaNueva*/, uint32 areaNueva) override
++    {
++        sVueloDinamico->AplicarReglaDeZona(jugador, areaNueva);
++    }
++};
++
++class script_vuelo_mundo : public WorldScript
++{
++public:
++    script_vuelo_mundo() : WorldScript("script_vuelo_mundo") { }
++
++    void OnStartup() override
++    {
++        sVueloDinamico->CargarConfig();
++    }
++};
++
++// "Cambiar estilo de vuelo": el cliente lo castea desde su propia barra.
++class spell_alternar_estilo_vuelo : public SpellScript
++{
++    PrepareSpellScript(spell_alternar_estilo_vuelo);
++
++    void HandleDespues()
++    {
++        if (Player* jugador = GetCaster()->ToPlayer())
++            sVueloDinamico->AlternarModo(jugador);
++    }
++
++    void Register() override
++    {
++        // Sin dependencia del efecto: la barra del cliente manda copias distintas de este hechizo.
++        AfterCast += SpellCastFn(spell_alternar_estilo_vuelo::HandleDespues);
++    }
++};
++
++// Ascenso al cielo / Impulso de avance / Aceleracion giratoria.
++class spell_impulso_vuelo : public SpellScript
++{
++    PrepareSpellScript(spell_impulso_vuelo);
++
++    void HandleDespues()
++    {
++        if (Player* jugador = GetCaster()->ToPlayer())
++            sVueloDinamico->EnviarImpulso(jugador, GetSpellInfo()->Id);
++    }
++
++    void Register() override
++    {
++        AfterCast += SpellCastFn(spell_impulso_vuelo::HandleDespues);
++    }
++};
++
++// ----------------------------------------------------------------------------
++// los comandos: un comando por tarea, y andan tambien por consola (por SOAP)
++// ----------------------------------------------------------------------------
++class comando_vuelo : public CommandScript
++{
++public:
++    comando_vuelo() : CommandScript("comando_vuelo") { }
++
++    std::span<ChatCommandBuilder const> GetCommands() const override
++    {
++        static ChatCommandTable vueloCommandTable =
++        {
++            // De lectura y de recarga: andan por consola, asi el agente mide sin el cliente abierto.
++            { "estado",   HandleEstadoCommand,   rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++            { "recargar", HandleRecargarCommand, rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++            // Sobre un personaje: tambien por nombre, por consola.
++            { "ensenar",  HandleEnsenarCommand,  rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++            { "modo",     HandleModoCommand,     rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++            // Reglas de vuelo por zona (world.vuelo_zona): donde se vuela y donde no.
++            { "zona",     HandleZonaCommand,     rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++            // Calibrar la fuerza de un impulso por familia (ascenso / avance / giro).
++            { "impulso",  HandleImpulsoCommand,  rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++            // Radiografia de un personaje (para diagnosticar sin adivinar).
++            { "pj",       HandlePjCommand,       rbac::RBAC_PERM_COMMAND_ADDITEM, Console::Yes },
++        };
++        static ChatCommandTable commandTable =
++        {
++            { "vuelo", vueloCommandTable },
++        };
++        return commandTable;
++    }
++
++    static bool HandleEstadoCommand(ChatHandler* handler)
++    {
++        std::string texto = sVueloDinamico->EstadoTexto();
++        handler->SendSysMessage(texto.c_str());
++        return true;
++    }
++
++    static bool HandleRecargarCommand(ChatHandler* handler)
++    {
++        sVueloDinamico->CargarConfig();
++        handler->SendSysMessage("Vuelo dinamico: configuracion recargada desde world.vuelo_*.");
++        return true;
++    }
++
++    // .vuelo ensenar <personaje>
++    static bool HandleEnsenarCommand(ChatHandler* handler, char const* args)
++    {
++        std::string nombre = args ? args : "";
++        // el nombre puede venir con espacios de mas
++        while (!nombre.empty() && (nombre.back() == ' ' || nombre.back() == '\t'))
++            nombre.pop_back();
++
++        if (nombre.empty())
++        {
++            handler->SendSysMessage("Uso: .vuelo ensenar <personaje>");
++            return false;
++        }
++
++        Player* jugador = BuscarJugador(handler, nombre);
++        if (!jugador)
++            return false;
++
++        sVueloDinamico->PonerAlDia(jugador);
++
++        // PonerAlDia aprende por nivel; aca se fuerza TODO lo que declara la base.
++        uint32 aprendidas = 0;
++        for (Trinity::VueloDinamico::Habilidad const& habilidad : sVueloDinamico->GetHabilidades())
++        {
++            if (jugador->HasSpell(habilidad.Hechizo))
++                continue;
++
++            jugador->LearnSpell(habilidad.Hechizo, false);
++            ++aprendidas;
++        }
++
++        handler->PSendSysMessage("%s: %u hechizos de vuelo aprendidos (estilo %s).",
++            jugador->GetName(), aprendidas,
++            sVueloDinamico->ModoDe(jugador) == Trinity::VueloDinamico::Modo::Cielonautica ? "cielonautica"
++                : sVueloDinamico->ModoDe(jugador) == Trinity::VueloDinamico::Modo::Estable ? "estable" : "ninguno");
++        return true;
++    }
++
++    // .vuelo modo <personaje> [cielonautica|estable]   (sin estilo, alterna)
++    static bool HandleModoCommand(ChatHandler* handler, char const* args)
++    {
++        std::string crudo = args ? args : "";
++        std::vector<char> copia(crudo.begin(), crudo.end());
++        copia.push_back('\0');
++
++        char* nombreArg = strtok(copia.data(), " \t");
++        char* estiloArg = nombreArg ? strtok(nullptr, " \t") : nullptr;
++
++        if (!nombreArg)
++        {
++            handler->SendSysMessage("Uso: .vuelo modo <personaje> [cielonautica|estable] (sin estilo, alterna)");
++            return false;
++        }
++
++        Player* jugador = BuscarJugador(handler, nombreArg);
++        if (!jugador)
++            return false;
++
++        std::string estilo = estiloArg ? estiloArg : "";
++
++        if (estilo == "cielonautica" || estilo == "estable")
++        {
++            Trinity::VueloDinamico::Modo deseado = estilo == "estable"
++                ? Trinity::VueloDinamico::Modo::Estable
++                : Trinity::VueloDinamico::Modo::Cielonautica;
++
++            if (sVueloDinamico->ModoDe(jugador) != deseado)
++                sVueloDinamico->AlternarModo(jugador);
++        }
++        else
++        {
++            sVueloDinamico->AlternarModo(jugador);
++        }
++
++        Trinity::VueloDinamico::Modo quedo = sVueloDinamico->ModoDe(jugador);
++        handler->PSendSysMessage("%s quedo en estilo %s.", jugador->GetName(),
++            quedo == Trinity::VueloDinamico::Modo::Cielonautica ? "cielonautica"
++                : quedo == Trinity::VueloDinamico::Modo::Estable ? "estable" : "ninguno (sin aura de estilo)");
++        return true;
++    }
++
++    // .vuelo zona [<personaje>] [todo|estable|nada|ver]
++    //   sin argumentos -> lista las zonas con regla cargada
++    //   con personaje  -> dice en que zona esta y que regla tiene (o `ver`)
++    //   con regla      -> fija la regla de ESA zona (se aplica en el momento y se guarda en
++    //                     world.vuelo_zona: la base sigue siendo la fuente de verdad).
++    static bool HandleZonaCommand(ChatHandler* handler, char const* args)
++    {
++        std::string crudo = args ? args : "";
++        std::vector<char> copia(crudo.begin(), crudo.end());
++        copia.push_back('\0');
++
++        char* nombreArg = strtok(copia.data(), " \t");
++        char* reglaArg = nombreArg ? strtok(nullptr, " \t") : nullptr;
++
++        if (!nombreArg)
++        {
++            auto const& zonas = sVueloDinamico->GetZonas();
++            if (zonas.empty())
++            {
++                handler->SendSysMessage("No hay zonas con regla: en todas se vuela segun el estilo de vuelo.");
++                handler->SendSysMessage("Uso: .vuelo zona <personaje> todo|estable|nada|ver");
++                return true;
++            }
++
++            handler->PSendSysMessage("%u zonas con regla propia:", uint32(zonas.size()));
++            for (auto const& [areaId, zona] : zonas)
++                handler->PSendSysMessage("  zona %u: %s (%s)", areaId, TextoRegla(zona.Regla), zona.Nota.c_str());
++            return true;
++        }
++
++        Player* jugador = BuscarJugador(handler, nombreArg);
++        if (!jugador)
++            return false;
++
++        uint32 area = jugador->GetAreaId();
++
++        if (!reglaArg || std::string(reglaArg) == "ver")
++        {
++            handler->PSendSysMessage("%s esta en la zona %u (mapa %u): la regla es '%s'.",
++                jugador->GetName(), area, jugador->GetMapId(), TextoRegla(sVueloDinamico->ReglaDeZona(jugador)));
++            return true;
++        }
++
++        std::string regla = reglaArg;
++        if (regla != "todo" && regla != "estable" && regla != "nada")
++        {
++            handler->SendSysMessage("Uso: .vuelo zona <personaje> todo|estable|nada|ver");
++            return false;
++        }
++
++        Trinity::VueloDinamico::ReglaZona nueva = regla == "nada" ? Trinity::VueloDinamico::ReglaZona::Nada
++            : regla == "estable" ? Trinity::VueloDinamico::ReglaZona::Estable
++            : Trinity::VueloDinamico::ReglaZona::Todo;
++
++        sVueloDinamico->FijarReglaDeZona(area, nueva, "puesta desde .vuelo zona");
++        sVueloDinamico->AplicarReglaDeZona(jugador, area);
++
++        handler->PSendSysMessage("Zona %u queda en '%s'. Se aplica al instante y queda en world.vuelo_zona.",
++            area, regla.c_str());
++        return true;
++    }
++
++    // .vuelo impulso <ascenso|avance|giro> <velocidad>
++    //   sin argumentos -> muestra lo que hay cargado
++    //   La velocidad es data pura (world.vuelo_impulso): el codigo no tiene ningun valor quemado,
++    //   solo decide la direccion (ascenso = para arriba, avance/giro = hacia donde mira el draco).
++    static bool HandleImpulsoCommand(ChatHandler* handler, char const* args)
++    {
++        if (!args || !*args)
++        {
++            handler->SendSysMessage(sVueloDinamico->EstadoTexto().c_str());
++            return true;
++        }
++
++        std::string crudo = args;
++        std::vector<char> copia(crudo.begin(), crudo.end());
++        copia.push_back('\0');
++
++        char* tipoArg = strtok(copia.data(), " \t");
++        char* valorArg = tipoArg ? strtok(nullptr, " \t") : nullptr;
++
++        if (!tipoArg || !valorArg)
++        {
++            handler->SendSysMessage("Uso: .vuelo impulso <ascenso|avance|giro> <velocidad>");
++            return false;
++        }
++
++        std::string tipo = tipoArg;
++        if (tipo != "ascenso" && tipo != "avance" && tipo != "giro")
++        {
++            handler->SendSysMessage("Uso: .vuelo impulso <ascenso|avance|giro> <velocidad>");
++            return false;
++        }
++
++        float velocidad = 0.0f;
++        try
++        {
++            velocidad = std::stof(valorArg);
++        }
++        catch (std::exception const&)
++        {
++            handler->SendSysMessage("La velocidad tiene que ser un numero (ejemplo: .vuelo impulso ascenso 18)");
++            return false;
++        }
++
++        if (velocidad <= 0.0f || velocidad > 200.0f)
++        {
++            handler->SendSysMessage("La velocidad tiene que estar entre 0 y 200 (el cliente recorta cerca de 88).");
++            return false;
++        }
++
++        Trinity::VueloDinamico::TipoImpulso elegido = tipo == "ascenso" ? Trinity::VueloDinamico::TipoImpulso::Ascenso
++            : tipo == "giro" ? Trinity::VueloDinamico::TipoImpulso::Giro
++            : Trinity::VueloDinamico::TipoImpulso::Avance;
++
++        sVueloDinamico->FijarVelocidadImpulso(elegido, velocidad);
++
++        handler->PSendSysMessage("Impulsos '%s' quedan en velocidad %.1f (y queda guardado en world.vuelo_impulso).",
++            tipo.c_str(), velocidad);
++        return true;
++    }
++
++    // .vuelo pj <personaje>
++    //   Radiografia para diagnosticar en vivo: montura, auras de estilo y vigor, flags de
++    //   movimiento y si el cliente esta reportando vuelo dinamico (AdvFlying). El modo dinamico lo
++    //   enciende el CLIENTE; esto dice si lo encendio o si esta volando en el modelo viejo.
++    static bool HandlePjCommand(ChatHandler* handler, char const* args)
++    {
++        std::string nombre = args ? args : "";
++        while (!nombre.empty() && (nombre.back() == ' ' || nombre.back() == '\t'))
++            nombre.pop_back();
++
++        if (nombre.empty())
++        {
++            handler->SendSysMessage("Uso: .vuelo pj <personaje>");
++            return false;
++        }
++
++        Player* jugador = BuscarJugador(handler, nombre);
++        if (!jugador)
++            return false;
++
++        handler->SendSysMessage(sVueloDinamico->EstadoJugador(jugador).c_str());
++        return true;
++    }
++
++private:
++    static char const* TextoRegla(Trinity::VueloDinamico::ReglaZona regla)
++    {
++        switch (regla)
++        {
++            case Trinity::VueloDinamico::ReglaZona::Nada:    return "no se vuela";
++            case Trinity::VueloDinamico::ReglaZona::Estable: return "solo vuelo estable";
++            default:                                         return "vuelo normal";
++        }
++    }
++
++    // Acepta el nombre de un personaje conectado (desde la consola no hay "seleccionado").
++    static Player* BuscarJugador(ChatHandler* handler, std::string const& nombre)
++    {
++        ObjectGuid guid = sCharacterCache->GetCharacterGuidByName(nombre);
++        if (!guid)
++        {
++            handler->PSendSysMessage("No existe ningun personaje llamado '%s'.", nombre.c_str());
++            return nullptr;
++        }
++
++        Player* jugador = ObjectAccessor::FindConnectedPlayer(guid);
++        if (!jugador)
++        {
++            handler->PSendSysMessage("El personaje '%s' no esta conectado: el estilo y las habilidades se aplican en vivo.", nombre.c_str());
++            return nullptr;
++        }
++
++        return jugador;
++    }
++};
++} // namespace
++
++void AddSC_vuelo_dinamico()
++{
++    new script_vuelo_jugador();
++    new script_vuelo_mundo();
++    new comando_vuelo();
++
++    RegisterSpellScript(spell_alternar_estilo_vuelo);
++    RegisterSpellScript(spell_impulso_vuelo);
++}

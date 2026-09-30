@@ -1,0 +1,89 @@
+diff --git a/src/server/game/Handlers/QuestHandler.cpp b/src/server/game/Handlers/QuestHandler.cpp
+index 69c0643fbc..9b9c2e7903 100644
+--- a/src/server/game/Handlers/QuestHandler.cpp
++++ b/src/server/game/Handlers/QuestHandler.cpp
+@@ -747,6 +747,34 @@ void WorldSession::HandleQuestgiverStatusMultipleQuery(WorldPackets::Quest::Ques
+     _player->SendQuestGiverStatusMultiple();
+ }
+ 
++// El cliente pregunta, para un NPC de mision, cuales de esos items le sirven al jugador.
++// Formato de la respuesta verificado contra el volcado del cliente oficial (12.1.0.69933),
++// 74 de 74 muestras consumidas exactas (ver docs/ANALISIS-PAQUETES-PENDIENTES.md):
++//   PackedGuid QuestGiverGUID   (se refleja el del pedido)
++//   uint32     Result           (1 en las 74 muestras)
++//   uint32     ItemGuidCount
++//   PackedGuid ItemGUID
++//   uint8      IsUsable
++void WorldSession::HandleQueryQuestItemUsability(WorldPackets::Quest::QueryQuestItemUsability& packet)
++{
++    WorldPacket data(SMSG_QUEST_ITEM_USABILITY_RESPONSE, 20 + packet.ItemGuids.size() * 12);
++    data << packet.QuestGiverGUID;
++    data << uint32(1);
++    data << uint32(packet.ItemGuids.size());
++
++    for (ObjectGuid const& itemGuid : packet.ItemGuids)
++    {
++        data << itemGuid;
++
++        // La semantica exacta de la bandera esta pendiente de capturar (en el oficial las 74
++        // muestras venian en 0), asi que solo se marca lo verificable: que el jugador lo tenga.
++        bool usable = itemGuid.IsItem() && _player->GetItemByGuid(itemGuid) != nullptr;
++        data << uint8(usable ? 1 : 0);
++    }
++
++    SendPacket(&data);
++}
++
+ void WorldSession::HandleRequestWorldQuestUpdate(WorldPackets::Quest::RequestWorldQuestUpdate& /*packet*/)
+ {
+     WorldPackets::Quest::WorldQuestUpdateResponse response;
+diff --git a/src/server/game/Server/Packets/QuestPackets.cpp b/src/server/game/Server/Packets/QuestPackets.cpp
+index 547a7592c5..f0e4401cc0 100644
+--- a/src/server/game/Server/Packets/QuestPackets.cpp
++++ b/src/server/game/Server/Packets/QuestPackets.cpp
+@@ -71,6 +71,23 @@ void QuestGiverHello::Read()
+     _worldPacket >> QuestGiverGUID;
+ }
+ 
++void QueryQuestItemUsability::Read()
++{
++    _worldPacket >> QuestGiverGUID;
++
++    uint32 itemGuidCount = 0;
++    _worldPacket >> itemGuidCount;
++
++    // El conteo viene del cliente: se acota antes de reservar para que un paquete malformado
++    // no pida una reserva gigante.
++    if (itemGuidCount > 100)
++        itemGuidCount = 100;
++
++    ItemGuids.resize(itemGuidCount);
++    for (ObjectGuid& itemGuid : ItemGuids)
++        _worldPacket >> itemGuid;
++}
++
+ void QueryQuestInfo::Read()
+ {
+     _worldPacket >> QuestID;
+diff --git a/src/server/game/Server/Packets/QuestPackets.h b/src/server/game/Server/Packets/QuestPackets.h
+index 606828ed05..647bfa3416 100644
+--- a/src/server/game/Server/Packets/QuestPackets.h
++++ b/src/server/game/Server/Packets/QuestPackets.h
+@@ -90,6 +90,17 @@ namespace WorldPackets
+             ObjectGuid QuestGiverGUID;
+         };
+ 
++        class QueryQuestItemUsability final : public ClientPacket
++        {
++        public:
++            explicit QueryQuestItemUsability(WorldPacket&& packet) : ClientPacket(CMSG_QUERY_QUEST_ITEM_USABILITY, std::move(packet)) { }
++
++            void Read() override;
++
++            ObjectGuid QuestGiverGUID;
++            std::vector<ObjectGuid> ItemGuids;
++        };
++
+         class QueryQuestInfo final : public ClientPacket
+         {
+         public:

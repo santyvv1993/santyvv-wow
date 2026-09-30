@@ -1,0 +1,859 @@
+diff --git a/src/common/Common.cpp b/src/common/Common.cpp
+index 0cc12877db..a7840098a9 100644
+--- a/src/common/Common.cpp
++++ b/src/common/Common.cpp
+@@ -39,6 +39,17 @@ LocaleConstant GetLocaleByName(std::string_view name)
+         if (name == localeNames[i])
+             return LocaleConstant(i);
+ 
++    // El cliente tambien manda locales que no tienen datos propios (CascLocaleBit los lista como
++    // enGB, enCN, enTW y ptPT, que este enum no incluye). Se resuelven contra el idioma que
++    // comparte sus datos para que el servidor no los rechace al iniciar sesion
++    // (AuthenticationService::HandleLogon devuelve ERROR_BAD_LOCALE si el locale no se reconoce).
++    if (name == "enGB" || name == "enCN")
++        return LOCALE_enUS;
++    if (name == "enTW")
++        return LOCALE_zhTW;
++    if (name == "ptPT")
++        return LOCALE_ptBR;
++
+     return TOTAL_LOCALES;
+ }
+ 
+diff --git a/src/common/Logging/AppenderFile.cpp b/src/common/Logging/AppenderFile.cpp
+index 2a8db9b4e0..0c965f0f7f 100644
+--- a/src/common/Logging/AppenderFile.cpp
++++ b/src/common/Logging/AppenderFile.cpp
+@@ -20,6 +20,9 @@
+ #include "LogMessage.h"
+ #include "StringConvert.h"
+ #include <algorithm>
++#include <cerrno>
++#include <cstdio>
++#include <cstring>
+ 
+ AppenderFile::AppenderFile(uint8 id, std::string name, LogLevel level, AppenderFlags flags, std::vector<std::string_view> const& args) :
+     Appender(id, std::move(name), level, flags),
+@@ -105,11 +108,16 @@ FILE* AppenderFile::OpenFile(std::string const& filename, std::string const& mod
+     if (backup)
+     {
+         CloseFile();
+-        std::string newName(fullName);
+-        newName.push_back('.');
+-        newName.append(LogMessage::getTimeStr(time(nullptr)));
+-        std::replace(newName.begin(), newName.end(), ':', '-');
+-        rename(fullName.c_str(), newName.c_str()); // no error handling... if we couldn't make a backup, just ignore
++        // Sanitize ONLY the timestamp we are about to append: ':' is not a valid file name character
++        // on Windows. Doing it over the whole new name also mangles the path (with an absolute LogsDir
++        // the drive letter "E:" became "E-"), rename() then fails and, because the failure was ignored,
++        // the log ended up truncated by the fopen(..., "w") below instead of backed up - i.e. the
++        // previous log was silently lost.
++        std::string timestamp(LogMessage::getTimeStr(time(nullptr)));
++        std::replace(timestamp.begin(), timestamp.end(), ':', '-');
++        std::string newName(fullName + "." + timestamp);
++        if (rename(fullName.c_str(), newName.c_str()) != 0)
++            fprintf(stderr, "Could not back up \"%s\" to \"%s\": %s\n", fullName.c_str(), newName.c_str(), strerror(errno));
+     }
+ 
+     if (FILE* ret = fopen(fullName.c_str(), mode.c_str()))
+diff --git a/src/server/database/Database/DatabaseWorkerPool.cpp b/src/server/database/Database/DatabaseWorkerPool.cpp
+index 1eec121a6a..a27687f9c9 100644
+--- a/src/server/database/Database/DatabaseWorkerPool.cpp
++++ b/src/server/database/Database/DatabaseWorkerPool.cpp
+@@ -33,8 +33,10 @@
+ #include "QueryResult.h"
+ #include "Transaction.h"
+ #include "MySQLWorkaround.h"
++#include <chrono>
+ #include <boost/asio/use_future.hpp>
+ #include <mysqld_error.h>
++#include <thread>
+ #include <utility>
+ #ifdef TRINITY_DEBUG
+ #include <boost/stacktrace.hpp>
+@@ -524,13 +526,31 @@ T* DatabaseWorkerPool<T>::GetFreeConnection()
+     uint8 i = 0;
+     auto const num_cons = _connections[IDX_SYNCH].size();
+     T* connection = nullptr;
+-    //! Block forever until a connection is free
++    //! Block until a connection is free. Every sync connection of this database being busy is the
++    //! only case worth waiting for here, and a bare try_lock loop is not free: it burns a core
++    //! competing with the thread that actually holds the connection, and if a query gets stuck it
++    //! spins forever without saying anything. So: yield while it may be momentary, then back off
++    //! and put it in the log, so a hang leaves a trace instead of a hot CPU.
++    uint32 tries = 0;
+     for (;;)
+     {
+         connection = _connections[IDX_SYNCH][i++ % num_cons].get();
+         //! Must be matched with t->Unlock() or you will get deadlocks
+         if (connection->LockIfReady())
+             break;
++
++        if (++tries < num_cons) // first pass over the connections: they may just be momentarily busy
++        {
++            std::this_thread::yield();
++            continue;
++        }
++
++        if (tries == num_cons)
++            TC_LOG_WARN("sql.performances", "All {} sync connection(s) are busy; waiting with back-off", num_cons);
++        else if (tries % 5000 == 0) // 5000 rounds of 1 ms => roughly every 5 seconds
++            TC_LOG_WARN("sql.performances", "Still no free sync connection ({} tries, ~{} s) - is a sync query stuck?", tries, tries / 5000 * 5);
++
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+     }
+ 
+     return connection;
+diff --git a/src/server/database/Database/Implementation/LoginDatabase.cpp b/src/server/database/Database/Implementation/LoginDatabase.cpp
+index 0a92b1802e..06718285d4 100644
+--- a/src/server/database/Database/Implementation/LoginDatabase.cpp
++++ b/src/server/database/Database/Implementation/LoginDatabase.cpp
+@@ -199,6 +199,13 @@ void LoginDatabaseConnection::DoPrepareStatements()
+     PrepareStatement(LOGIN_UPD_BNET_WARBAND_SCENE, "UPDATE battlenet_account_warband_scenes SET isFavorite = ?, hasFanfare = ? WHERE battlenetAccountId = ? AND warbandSceneId = ?", CONNECTION_ASYNC);
+     PrepareStatement(LOGIN_DEL_BNET_WARBAND_SCENE, "DELETE FROM battlenet_account_warband_scenes WHERE battlenetAccountId = ? AND warbandSceneId = ?", CONNECTION_ASYNC);
+ 
++    PrepareStatement(LOGIN_SEL_BNET_WARBAND_GROUPS, "SELECT groupId, orderIndex, warbandSceneId, flags, contentSetId, name FROM battlenet_account_warband_groups WHERE battlenetAccountId = ? ORDER BY orderIndex", CONNECTION_ASYNC);
++    PrepareStatement(LOGIN_SEL_BNET_WARBAND_GROUP_MEMBERS, "SELECT groupId, characterGuid, warbandScenePlacementId, type, contentSetId FROM battlenet_account_warband_group_members WHERE battlenetAccountId = ?", CONNECTION_ASYNC);
++    PrepareStatement(LOGIN_DEL_BNET_WARBAND_GROUPS, "DELETE FROM battlenet_account_warband_groups WHERE battlenetAccountId = ?", CONNECTION_ASYNC);
++    PrepareStatement(LOGIN_DEL_BNET_WARBAND_GROUP_MEMBERS, "DELETE FROM battlenet_account_warband_group_members WHERE battlenetAccountId = ?", CONNECTION_ASYNC);
++    PrepareStatement(LOGIN_INS_BNET_WARBAND_GROUP, "INSERT INTO battlenet_account_warband_groups (battlenetAccountId, groupId, orderIndex, warbandSceneId, flags, contentSetId, name) VALUES (?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
++    PrepareStatement(LOGIN_INS_BNET_WARBAND_GROUP_MEMBER, "INSERT INTO battlenet_account_warband_group_members (battlenetAccountId, groupId, characterGuid, warbandScenePlacementId, type, contentSetId) VALUES (?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
++
+     PrepareStatement(LOGIN_SEL_BNET_PLAYER_DATA_ELEMENTS_ACCOUNT, "SELECT playerDataElementAccountId, floatValue, int64Value FROM battlenet_account_player_data_element WHERE battlenetAccountId = ?", CONNECTION_ASYNC);
+     PrepareStatement(LOGIN_DEL_BNET_PLAYER_DATA_ELEMENTS_ACCOUNT, "DELETE FROM battlenet_account_player_data_element WHERE battlenetAccountId = ? AND playerDataElementAccountId = ?", CONNECTION_ASYNC);
+     PrepareStatement(LOGIN_INS_BNET_PLAYER_DATA_ELEMENTS_ACCOUNT, "INSERT INTO battlenet_account_player_data_element (battlenetAccountId, playerDataElementAccountId, floatValue, int64Value) VALUES (?, ?, ?, ?)", CONNECTION_ASYNC);
+diff --git a/src/server/database/Database/Implementation/LoginDatabase.h b/src/server/database/Database/Implementation/LoginDatabase.h
+index 53d1d7a769..faebc75909 100644
+--- a/src/server/database/Database/Implementation/LoginDatabase.h
++++ b/src/server/database/Database/Implementation/LoginDatabase.h
+@@ -183,6 +183,14 @@ enum LoginDatabaseStatements : uint32
+     LOGIN_UPD_BNET_WARBAND_SCENE,
+     LOGIN_DEL_BNET_WARBAND_SCENE,
+ 
++    // Mod propio: grupos de escuadra (campamentos) del warband
++    LOGIN_SEL_BNET_WARBAND_GROUPS,
++    LOGIN_SEL_BNET_WARBAND_GROUP_MEMBERS,
++    LOGIN_DEL_BNET_WARBAND_GROUPS,
++    LOGIN_DEL_BNET_WARBAND_GROUP_MEMBERS,
++    LOGIN_INS_BNET_WARBAND_GROUP,
++    LOGIN_INS_BNET_WARBAND_GROUP_MEMBER,
++
+     LOGIN_SEL_BNET_PLAYER_DATA_ELEMENTS_ACCOUNT,
+     LOGIN_DEL_BNET_PLAYER_DATA_ELEMENTS_ACCOUNT,
+     LOGIN_INS_BNET_PLAYER_DATA_ELEMENTS_ACCOUNT,
+diff --git a/src/server/game/Entities/Creature/Creature.cpp b/src/server/game/Entities/Creature/Creature.cpp
+index f055a58e39..6a20848824 100644
+--- a/src/server/game/Entities/Creature/Creature.cpp
++++ b/src/server/game/Entities/Creature/Creature.cpp
+@@ -26,6 +26,7 @@
+ #include "CreatureGroups.h"
+ #include "DB2Stores.h"
+ #include "DatabaseEnv.h"
++#include "EscaladoEstanciaMgr.h"
+ #include "Formulas.h"
+ #include "GameEventMgr.h"
+ #include "GameTime.h"
+@@ -3156,6 +3157,12 @@ void Creature::ApplyLevelScaling()
+     }
+ 
+     ApplyLevelScaling(contentTuningId, scalingLevelDelta);
++
++    // Fase 2 del escalado por estancia: si el mapa y su dificultad tienen una regla declarada en
++    // `world.instancia_escalado`, aca -y no solo al arrancar una corrida- queda escalada la criatura.
++    // Es el punto que cierra el limite conocido: las oleadas, las invocadas y los jefes que se suman
++    // a mitad de la corrida tambien entran por este camino.
++    sEscaladoInstancia->AplicarAlSpawn(this);
+ }
+ 
+ void Creature::ApplyLevelScaling(int32 contentTuningId, int32 scalingLevelDelta)
+@@ -3170,6 +3177,33 @@ void Creature::ApplyLevelScaling(int32 contentTuningId, int32 scalingLevelDelta)
+     SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::ContentTuningID), contentTuningId);
+ }
+ 
++// El nivel que el jugador VE en una criatura escalable no es UNIT_FIELD_LEVEL: el cliente lo calcula
++// con los campos de escalado, igual que ::GetLevelForTarget:
++//     nivel mostrado = clamp(nivelDelJugador, ScalingLevelMin, ScalingLevelMax) + ScalingLevelDelta
++// Por eso, en una mazmorra de una expansion vieja (ContentTuning 502 = min/max 50) subir el nivel del
++// servidor con SetLevel no cambia el rotulo: el clamp sigue topando en 50. Correr el delta es lo que
++// mueve el numero en pantalla. Se dejan Min/Max como los declara el ContentTuning del contenido, de
++// modo que el resultado es el mismo tanto si el cliente los toma de los campos como de su tabla; y de
++// paso GetLevelForTarget pasa a devolver el mismo nivel que ::GetLevel(), con lo que los multiplicadores
++// por objetivo (vida, dano, armadura) quedan en 1.0 en vez de mezclar dos niveles.
++void Creature::SetScaledDisplayLevel(uint8 level)
++{
++    if (!HasScalableLevels())
++        return; // sin ContentTuning el cliente ya dibuja UNIT_FIELD_LEVEL
++
++    SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::ScalingLevelDelta),
++        int32(level) - m_unitData->ScalingLevelMax);
++}
++
++// La banda declarada por la estancia (world.instancia_escalado, modo 'rango'): se sobreescriben Min y
++// Max y el delta queda como el dato de la criatura, asi que lo que el cliente rotula pasa a ser
++// clamp(nivelDelJugador, min, max) + delta y SelectLevel() toma max + delta para el nivel del servidor.
++void Creature::SetScalingLevelRange(uint8 nivelMin, uint8 nivelMax)
++{
++    SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::ScalingLevelMin), int32(nivelMin));
++    SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::ScalingLevelMax), int32(nivelMax));
++}
++
+ uint64 Creature::GetMaxHealthByLevel(uint8 level) const
+ {
+     CreatureTemplate const* cInfo = GetCreatureTemplate();
+diff --git a/src/server/game/Entities/Creature/Creature.h b/src/server/game/Entities/Creature/Creature.h
+index 97391a1b3d..c0c93fbd03 100644
+--- a/src/server/game/Entities/Creature/Creature.h
++++ b/src/server/game/Entities/Creature/Creature.h
+@@ -210,6 +210,13 @@ class TC_GAME_API Creature : public Unit, public GridObject<Creature>, public Ma
+         bool HasScalableLevels() const;
+         void ApplyLevelScaling();
+         void ApplyLevelScaling(int32 contentTuningId, int32 scalingLevelDelta);
++        // Ajusta el nivel que el CLIENTE dibuja para una criatura escalable (no sale de UNIT_FIELD_LEVEL).
++        // Lo usa el escalado de mitica+: ver la implementacion para el porque.
++        void SetScaledDisplayLevel(uint8 level);
++        // Fija la banda [min, max] del escalado del contenido (los campos con los que el cliente
++        // rotula y el core calcula vida/dano). Lo usa el escalado por estancia (Fase 2), que lee la
++        // banda de `world.instancia_escalado`; el delta NO se toca, sigue siendo el dato de la criatura.
++        void SetScalingLevelRange(uint8 nivelMin, uint8 nivelMax);
+         uint8 GetLevelForTarget(WorldObject const* target) const override;
+ 
+         uint64 GetMaxHealthByLevel(uint8 level) const;
+diff --git a/src/server/game/Entities/Player/Player.cpp b/src/server/game/Entities/Player/Player.cpp
+index 800adfea3e..6fe807a978 100644
+--- a/src/server/game/Entities/Player/Player.cpp
++++ b/src/server/game/Entities/Player/Player.cpp
+@@ -13816,6 +13816,32 @@ void Player::SendItemPassives()
+     SendDirectMessage(sendItemPassives.Write());
+ }
+ 
++// ── miticas+ (modulo propio): puerta minima al update field del HUD ──────────────────────────────
++// `ActivePlayerData.ChallengeModeData` es un campo OPCIONAL: se construye al marcarlo y se destruye al
++// quitarlo. El cliente lee de ahi el temporizador de la mítica+; si nunca se escribe, tiene StartTime = 0
++// y el panel de cierre muestra el tiempo mal ("se acabo el tiempo" con medalla buena).
++void Player::MarcarDesafioMythicPlus(int32 mapId, int32 jugadoresIniciales, uint64 instancia, int64 inicio,
++    ObjectGuid duenoDeLaPiedra, bool conRestricciones)
++{
++    auto datos = m_values.ModifyValue(&Player::m_activePlayerData)
++                     .ModifyValue(&UF::ActivePlayerData::ChallengeModeData, 0);
++
++    SetUpdateFieldValue(datos.ModifyValue(&UF::ChallengeModeData::MapID), mapId);
++    SetUpdateFieldValue(datos.ModifyValue(&UF::ChallengeModeData::InitialPlayerCount), jugadoresIniciales);
++    SetUpdateFieldValue(datos.ModifyValue(&UF::ChallengeModeData::InstanceID), instancia);
++    SetUpdateFieldValue(datos.ModifyValue(&UF::ChallengeModeData::StartTime), inicio);
++    SetUpdateFieldValue(datos.ModifyValue(&UF::ChallengeModeData::KeystoneOwnerGUID), duenoDeLaPiedra);
++    SetUpdateFieldValue(datos.ModifyValue(&UF::ChallengeModeData::IsActive), uint32(1));
++    SetUpdateFieldValue(datos.ModifyValue(&UF::ChallengeModeData::HasRestrictions), uint32(conRestricciones ? 1 : 0));
++    SetUpdateFieldValue(datos.ModifyValue(&UF::ChallengeModeData::CanVoteAbandon), uint32(1));
++}
++
++void Player::QuitarDesafioMythicPlus()
++{
++    RemoveOptionalUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData)
++                                       .ModifyValue(&UF::ActivePlayerData::ChallengeModeData));
++}
++
+ void Player::SendNewItem(Item* item, uint32 quantity, bool pushed, bool created, bool broadcast /*= false*/, uint32 dungeonEncounterId /*= 0*/)
+ {
+     if (!item)  // prevent crash
+@@ -18834,9 +18860,35 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
+         GetSession()->GetCollectionMgr()->AddTransmogIllusion(transmogIllusion->ID);
+     }
+ 
++    LoadAccountBankMoney();
++
+     return true;
+ }
+ 
++// El oro del banco de cuenta vive en el campo AccountBankCoinage (ActivePlayerData) y el core no
++// lo persiste. Se guarda en `characters.character_account_bank`, una fila por personaje, y se
++// carga ANTES de que el jugador entre al mundo para que venga en el bloque de creacion que recibe
++// el cliente (si se cargara despues, el cliente mostraria 0 hasta la primera operacion).
++void Player::LoadAccountBankMoney()
++{
++    uint64 money = 0;
++
++    // El fork no acepta std::string en Query/Execute: la via con formato es PQuery/PExecute
++    // (Trinity::StringFormat, con {}).
++    if (QueryResult result = CharacterDatabase.PQuery("SELECT money FROM character_account_bank WHERE guid = {}", GetGUID().GetCounter()))
++        money = result->Fetch()[0].GetUInt64();
++
++    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::AccountBankCoinage), money);
++}
++
++void Player::SetAccountBankMoney(uint64 money)
++{
++    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::AccountBankCoinage), money);
++
++    // Se guarda al instante: si el servidor se cae, el oro del banco tiene que estar en disco.
++    CharacterDatabase.PExecute("REPLACE INTO character_account_bank (guid, money) VALUES ({}, {})", GetGUID().GetCounter(), money);
++}
++
+ void Player::PushQuests()
+ {
+     for (Quest const* quest : sObjectMgr->GetQuestTemplatesAutoPush())
+@@ -29369,6 +29421,19 @@ void Player::DeleteTraitConfig(int32 deletedConfigId)
+     m_traitConfigStates[deletedConfigId] = PLAYERSPELL_REMOVED;
+ }
+ 
++// Vuelo dinamico: el empujon de las habilidades activas de cielonautica (Ascenso al cielo,
++// Impulso de avance, Aceleracion giratoria). El opcode SMSG_MOVE_ADD_IMPULSE pasa a STATUS_NEVER
++// y el ack a HandleMovementAckMessage (ver Opcodes.cpp); el sistema que lo usa vive en
++// src/server/game/VueloDinamico/.
++void Player::AddMoveImpulse(Position direction)
++{
++    WorldPackets::Movement::MoveAddImpulse paquete;
++    paquete.MoverGUID = GetGUID();
++    paquete.SequenceIndex = m_movementCounter++;
++    paquete.Direction = direction;
++    SendMessageToSet(paquete.Write(), true);
++}
++
+ void Player::ApplyTraitConfig(int32 configId, bool apply)
+ {
+     UF::TraitConfig const* traitConfig = GetTraitConfig(configId);
+diff --git a/src/server/game/Entities/Player/Player.h b/src/server/game/Entities/Player/Player.h
+index 81f21b7f0d..25f43c3af6 100644
+--- a/src/server/game/Entities/Player/Player.h
++++ b/src/server/game/Entities/Player/Player.h
+@@ -1511,6 +1511,11 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
+             SetUpdateFieldValue(setter.ModifyValue(&UF::BankTabSettings::Description), description);
+             SetUpdateFieldValue(setter.ModifyValue(&UF::BankTabSettings::DepositFlags), int32(depositFlags));
+         }
++        // Oro del banco de cuenta. Vive en el campo AccountBankCoinage del cliente y NO lo
++        // persiste el core: lo guarda esta clase en character_account_bank (ver LoadAccountBankMoney).
++        uint64 GetAccountBankMoney() const { return m_activePlayerData->AccountBankCoinage; }
++        void LoadAccountBankMoney();
++        void SetAccountBankMoney(uint64 money);
+         bool IsBackpackAutoSortDisabled() const { return m_activePlayerData->BackpackAutoSortDisabled; }
+         void SetBackpackAutoSortDisabled(bool disabled) { SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::BackpackAutoSortDisabled), disabled); }
+         bool IsBackpackSellJunkDisabled() const { return m_activePlayerData->BackpackSellJunkDisabled; }
+@@ -1632,6 +1637,15 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
+         bool IsTwoHandUsed() const;
+         bool IsUsingTwoHandedWeaponInOneHand() const;
+         void SendNewItem(Item* item, uint32 quantity, bool pushed, bool created, bool broadcast = false, uint32 dungeonEncounterId = 0);
++
++        // ── Modulo propio de miticas+ ─────────────────────────────────────────────────────────────
++        // El HUD de la mitica+ no lleva el temporizador en el paquete: el cliente lo lee del campo de
++        // update `ActivePlayerData.ChallengeModeData`. Los setters de update fields son `protected` en
++        // BaseEntity, asi que el modulo (que vive fuera de la clase) entra por estas dos puertas:
++        // marcar el desafio al arrancar la corrida y quitarlo al cerrarla.
++        void MarcarDesafioMythicPlus(int32 mapId, int32 jugadoresIniciales, uint64 instancia, int64 inicio,
++            ObjectGuid duenoDeLaPiedra, bool conRestricciones);
++        void QuitarDesafioMythicPlus();
+         bool BuyItemFromVendorSlot(ObjectGuid vendorguid, uint32 vendorslot, uint32 item, uint32 count, uint8 bag, uint8 slot);
+         Optional<SellResult> CanSellItemToVendor(Item const* item, uint32 amount) const;
+         Optional<SellResult> SellItemToVendor(Item* item, uint32 amount);
+@@ -2258,6 +2272,10 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
+ 
+         void RemovedInsignia(Player* looterPlr);
+ 
++        // Vuelo dinamico: manda SMSG_MOVE_ADD_IMPULSE para empujar al jugador (lo usan las
++        // habilidades activas de cielonautica; ver src/server/game/VueloDinamico/).
++        void AddMoveImpulse(Position direction);
++
+         WorldSession* GetSession() const { return m_session; }
+ 
+     protected:
+diff --git a/src/server/game/Entities/Unit/Unit.cpp b/src/server/game/Entities/Unit/Unit.cpp
+index b06ddf67d7..dea5d5df6d 100644
+--- a/src/server/game/Entities/Unit/Unit.cpp
++++ b/src/server/game/Entities/Unit/Unit.cpp
+@@ -9024,6 +9024,14 @@ void Unit::SetFlightCapabilityID(int32 flightCapabilityId, bool clientUpdate)
+     if (flightCapabilityId && !sFlightCapabilityStore.HasRecord(flightCapabilityId))
+         return;
+ 
++    // PARCHES-PROPIOS: si el ID cambia, el juego de parametros que el cliente tiene ya no vale y
++    // hay que reenviarlo entero. Asi lo hace retail: medido en el sniff de 12.1.0.69875 (21-sep-2026),
++    // cuando el vuelo dinamico se activa y desactiva (SMSG_MOVE_SET_CAN_ADV_FLY / UNSET_CAN_ADV_FLY)
++    // vuelven a salir los 13 parametros, y MAX_VEL + ADD_IMPULSE_MAX_SPEED salen 60 veces por sesion.
++    // Sin esto, mi filtro m_advFlyingParamsSent deja al cliente con los valores del modo anterior.
++    if (GetFlightCapabilityID() != flightCapabilityId)
++        m_advFlyingParamsSent = false;
++
+     SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::FlightCapabilityID), flightCapabilityId);
+ 
+     UpdateAdvFlyingSpeed(ADV_FLYING_AIR_FRICTION, clientUpdate);
+@@ -9039,6 +9047,33 @@ void Unit::SetFlightCapabilityID(int32 flightCapabilityId, bool clientUpdate)
+     UpdateAdvFlyingSpeed(ADV_FLYING_SURFACE_FRICTION, clientUpdate);
+     UpdateAdvFlyingSpeed(ADV_FLYING_OVER_MAX_DECELERATION, clientUpdate);
+     UpdateAdvFlyingSpeed(ADV_FLYING_LAUNCH_SPEED_COEFFICIENT, clientUpdate);
++
++    // PARCHES-PROPIOS: desde aca el cliente tiene este juego de parametros, y las llamadas
++    // repetidas con los mismos valores (el aura de montura llama en cada recalculacion) se
++    // descartan por cache. Mandarlos a repeticion reinicia el estado de vuelo del cliente.
++    if (clientUpdate)
++        m_advFlyingParamsSent = true;
++}
++
++// PARCHES-PROPRIOS: recorte que el propio servidor aplica encima de la capacidad de vuelo.
++// Retail no manda la fila del DB2 tal cual: con el vuelo dinamico encendido manda MaxVel 55.25 y
++// AddImpulseMaxSpeed 85 (los de la capacidad 11 por 0.85) y los devuelve a 65/100 al apagarlo
++// (medido en el sniff de 12.1.0.69875 del 21-sep-2026: los dos parametros cambian 60 veces por
++// sesion, los otros once no). Sin ese recorte el techo aero queda 18% arriba y el umbral de
++// "pasarse de velocidad" (la estela de aire al picar) no se alcanza.
++void Unit::SetAdvFlyingSpeedModifier(float maxVelFactor, float impulseMaxFactor, bool clientUpdate)
++{
++    if (maxVelFactor <= 0.0f || impulseMaxFactor <= 0.0f)
++        return;
++
++    if (m_advFlyingMaxVelFactor == maxVelFactor && m_advFlyingImpulseMaxFactor == impulseMaxFactor)
++        return;
++
++    m_advFlyingMaxVelFactor = maxVelFactor;
++    m_advFlyingImpulseMaxFactor = impulseMaxFactor;
++
++    UpdateAdvFlyingSpeed(ADV_FLYING_MAX_VEL, clientUpdate);
++    UpdateAdvFlyingSpeed(ADV_FLYING_ADD_IMPULSE_MAX_SPEED, clientUpdate);
+ }
+ 
+ void Unit::UpdateAdvFlyingSpeed(AdvFlyingRateTypeSingle speedType, bool clientUpdate)
+@@ -9084,7 +9119,15 @@ void Unit::UpdateAdvFlyingSpeed(AdvFlyingRateTypeSingle speedType, bool clientUp
+             ApplyPct(newValue, pos);
+     }
+ 
+-    if (m_advFlyingSpeed[speedType] == newValue)
++    // PARCHES-PROPRIOS: recorte propio del servidor (0.85 = el perfil del vuelo dinamico de retail).
++    if (speedType == ADV_FLYING_MAX_VEL && m_advFlyingMaxVelFactor != 1.0f)
++        newValue *= m_advFlyingMaxVelFactor;
++    else if (speedType == ADV_FLYING_ADD_IMPULSE_MAX_SPEED && m_advFlyingImpulseMaxFactor != 1.0f)
++        newValue *= m_advFlyingImpulseMaxFactor;
++
++    // PARCHES-PROPIOS: el cache puede coincidir porque se lleno en la inicializacion sin haber
++    // viajado nunca al cliente; mientras eso no pase, el paquete se manda igual.
++    if (m_advFlyingSpeed[speedType] == newValue && m_advFlyingParamsSent)
+         return;
+ 
+     m_advFlyingSpeed[speedType] = newValue;
+@@ -9092,6 +9135,9 @@ void Unit::UpdateAdvFlyingSpeed(AdvFlyingRateTypeSingle speedType, bool clientUp
+     if (!clientUpdate)
+         return;
+ 
++    TC_LOG_DEBUG("scripts.vuelo", "adv flying {} = {} (el mover es jugador: {})",
++        uint32(speedType), newValue, Unit::ToPlayer(GetUnitBeingMoved()) ? "si" : "no");
++
+     if (Player* playerMover = Unit::ToPlayer(GetUnitBeingMoved()))
+     {
+         WorldPackets::Movement::SetAdvFlyingSpeed selfpacket(opcode);
+@@ -9141,7 +9187,22 @@ void Unit::UpdateAdvFlyingSpeed(AdvFlyingRateTypeRange speedType, bool clientUpd
+         }
+     }
+ 
+-    if (m_advFlyingSpeed[speedType] == min && m_advFlyingSpeed[speedType + 1] == max)
++    // PARCHES-PROPIOS: el DB2 guarda banking y pitching en GRADOS, pero el cliente los espera en
++    // RADIANES. Retail manda 2.443460941314697265 / 4.712388992309570312 para el banking 140/270
++    // que el DB2 declara (medido en el sniff de 12.1.0.69875 del 20-sep-2026); TrinityCore los
++    // mandaba crudos, asi que el cliente recibia 140 donde espera 2.44 y el giro salia 57,3 veces
++    // mas rapido que en retail (giro desbocado con raton + A/D, y en el suelo no, porque solo
++    // aplica al vuelo dinamico). La conversion va ANTES del cache para que el paquete y el bloque
++    // de movimiento (BaseEntity.cpp) viajen en radianes, que es lo que el cliente parsea.
++    // Ojo: el umbral de giro NO se convierte, retail lo manda tal cual (45 .. 65), y ahi esta la
++    // prueba de que la conversion es solo para los tres angulares.
++    if (speedType != ADV_FLYING_TURN_VELOCITY_THRESHOLD)
++    {
++        min *= float(M_PI) / 180.0f;
++        max *= float(M_PI) / 180.0f;
++    }
++
++    if (m_advFlyingSpeed[speedType] == min && m_advFlyingSpeed[speedType + 1] == max && m_advFlyingParamsSent)
+         return;
+ 
+     m_advFlyingSpeed[speedType] = min;
+@@ -9150,6 +9211,9 @@ void Unit::UpdateAdvFlyingSpeed(AdvFlyingRateTypeRange speedType, bool clientUpd
+     if (!clientUpdate)
+         return;
+ 
++    TC_LOG_DEBUG("scripts.vuelo", "adv flying {} = {} .. {} (el mover es jugador: {})",
++        uint32(speedType), min, max, Unit::ToPlayer(GetUnitBeingMoved()) ? "si" : "no");
++
+     if (Player* playerMover = Unit::ToPlayer(GetUnitBeingMoved()))
+     {
+         WorldPackets::Movement::SetAdvFlyingSpeedRange selfpacket(opcode);
+diff --git a/src/server/game/Entities/Unit/Unit.h b/src/server/game/Entities/Unit/Unit.h
+index 9c87002fb3..8b2ec1bc9f 100644
+--- a/src/server/game/Entities/Unit/Unit.h
++++ b/src/server/game/Entities/Unit/Unit.h
+@@ -1740,6 +1740,9 @@ class TC_GAME_API Unit : public WorldObject
+         void UpdateAdvFlyingSpeed(AdvFlyingRateTypeSingle speedType, bool clientUpdate);
+         void UpdateAdvFlyingSpeed(AdvFlyingRateTypeRange speedType, bool clientUpdate);
+ 
++        // PARCHES-PROPRIOS: recorte propio encima de la capacidad de vuelo (1.0 = sin recorte).
++        void SetAdvFlyingSpeedModifier(float maxVelFactor, float impulseMaxFactor, bool clientUpdate);
++
+         void FollowerAdded(AbstractFollower* f);
+         void FollowerRemoved(AbstractFollower* f);
+         void RemoveAllFollowers();
+@@ -1958,6 +1961,15 @@ class TC_GAME_API Unit : public WorldObject
+ 
+         std::array<float, MAX_MOVE_TYPE> m_speed_rate;
+         std::array<float, ADV_FLYING_MAX_SPEED_TYPE> m_advFlyingSpeed;
++        // PARCHES-PROPIOS: si los valores de arriba ya viajaron al cliente. El cache arranca
++        // lleno (SetFlightCapabilityID(0, false) en el constructor), asi que sin esta marca el
++        // primer envio real se descartaba por "ya coincide" y el cliente volaba con sus valores.
++        bool m_advFlyingParamsSent = false;
++        // PARCHES-PROPRIOS: lo que el servidor recorta sobre MaxVel y AddImpulseMaxSpeed. Retail no
++        // manda la fila del DB2 tal cual: con el vuelo dinamico encendido manda 55.25/85 (0.85 de la
++        // capacidad que use) y vuelve a 1.0 al apagarlo. Ver SetAdvFlyingSpeedModifier.
++        float m_advFlyingMaxVelFactor = 1.0f;
++        float m_advFlyingImpulseMaxFactor = 1.0f;
+ 
+         Unit* m_unitMovedByMe;    // only ever set for players, and only for direct client control
+         Player* m_playerMovingMe; // only set for direct client control (possess effects, vehicles and similar)
+diff --git a/src/server/game/Server/Packets/AllPackets.h b/src/server/game/Server/Packets/AllPackets.h
+index 1cf71c8efc..a2c937836c 100644
+--- a/src/server/game/Server/Packets/AllPackets.h
++++ b/src/server/game/Server/Packets/AllPackets.h
+@@ -30,6 +30,7 @@
+ #include "BankPackets.h"
+ #include "BattlePetPackets.h"
+ #include "BattlegroundPackets.h"
++#include "ChallengeModePackets.h"
+ #include "BattlenetPackets.h"
+ #include "BlackMarketPackets.h"
+ #include "CalendarPackets.h"
+diff --git a/src/server/game/Server/Protocol/Opcodes.cpp b/src/server/game/Server/Protocol/Opcodes.cpp
+index 13e2a92122..47da1b7ff0 100644
+--- a/src/server/game/Server/Protocol/Opcodes.cpp
++++ b/src/server/game/Server/Protocol/Opcodes.cpp
+@@ -149,8 +149,8 @@ void OpcodeTable::InitializeClientOpcodes()
+     DEFINE_HANDLER(CMSG_ACCEPT_SOCIAL_CONTRACT,                             STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
+     DEFINE_HANDLER(CMSG_ACCEPT_TRADE,                                       STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleAcceptTradeOpcode);
+     DEFINE_HANDLER(CMSG_ACCEPT_WARGAME_INVITE,                              STATUS_UNHANDLED, PROCESS_INPLACE,      &WorldSession::Handle_NULL);
+-    DEFINE_HANDLER(CMSG_ACCOUNT_BANK_DEPOSIT_MONEY,                         STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
+-    DEFINE_HANDLER(CMSG_ACCOUNT_BANK_WITHDRAW_MONEY,                        STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
++    DEFINE_HANDLER(CMSG_ACCOUNT_BANK_DEPOSIT_MONEY,                         STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleAccountBankDepositMoney);
++    DEFINE_HANDLER(CMSG_ACCOUNT_BANK_WITHDRAW_MONEY,                        STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleAccountBankWithdrawMoney);
+     DEFINE_HANDLER(CMSG_ACCOUNT_NOTIFICATION_ACKNOWLEDGED,                  STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
+     DEFINE_HANDLER(CMSG_ACCOUNT_STORE_BEGIN_PURCHASE_OR_REFUND,             STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
+     DEFINE_HANDLER(CMSG_ACTIVATE_SOULBIND,                                  STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
+@@ -710,7 +710,7 @@ void OpcodeTable::InitializeClientOpcodes()
+     DEFINE_HANDLER(CMSG_MOUNT_CLEAR_FANFARE,                                STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
+     DEFINE_HANDLER(CMSG_MOUNT_SET_FAVORITE,                                 STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleMountSetFavorite);
+     DEFINE_HANDLER(CMSG_MOUNT_SPECIAL_ANIM,                                 STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleMountSpecialAnimOpcode);
+-    DEFINE_HANDLER(CMSG_MOVE_ADD_IMPULSE_ACK,                               STATUS_UNHANDLED, PROCESS_THREADSAFE,   &WorldSession::Handle_NULL);
++    DEFINE_HANDLER(CMSG_MOVE_ADD_IMPULSE_ACK,                               STATUS_LOGGEDIN,  PROCESS_THREADSAFE,   &WorldSession::HandleMovementAckMessage);
+     DEFINE_HANDLER(CMSG_MOVE_APPLY_INERTIA_ACK,                             STATUS_LOGGEDIN,  PROCESS_THREADSAFE,   &WorldSession::HandleMoveApplyInertiaAck);
+     DEFINE_HANDLER(CMSG_MOVE_APPLY_MOVEMENT_FORCE_ACK,                      STATUS_LOGGEDIN,  PROCESS_THREADSAFE,   &WorldSession::HandleMoveApplyMovementForceAck);
+     DEFINE_HANDLER(CMSG_MOVE_CHANGE_TRANSPORT,                              STATUS_LOGGEDIN,  PROCESS_THREADSAFE,   &WorldSession::HandleMovementOpcodes);
+@@ -903,7 +903,7 @@ void OpcodeTable::InitializeClientOpcodes()
+     DEFINE_HANDLER(CMSG_QUERY_PLAYER_NAME_BY_COMMUNITY_ID,                  STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
+     DEFINE_HANDLER(CMSG_QUERY_QUEST_COMPLETION_NPCS,                        STATUS_LOGGEDIN,  PROCESS_INPLACE,      &WorldSession::HandleQueryQuestCompletionNPCs);
+     DEFINE_HANDLER(CMSG_QUERY_QUEST_INFO,                                   STATUS_LOGGEDIN,  PROCESS_INPLACE,      &WorldSession::HandleQuestQueryOpcode);
+-    DEFINE_HANDLER(CMSG_QUERY_QUEST_ITEM_USABILITY,                         STATUS_UNHANDLED, PROCESS_INPLACE,      &WorldSession::Handle_NULL);
++    DEFINE_HANDLER(CMSG_QUERY_QUEST_ITEM_USABILITY,                         STATUS_LOGGEDIN,  PROCESS_INPLACE,      &WorldSession::HandleQueryQuestItemUsability);
+     DEFINE_HANDLER(CMSG_QUERY_REALM_NAME,                                   STATUS_AUTHED,    PROCESS_INPLACE,      &WorldSession::HandleQueryRealmName);
+     DEFINE_HANDLER(CMSG_QUERY_SCENARIO_POI,                                 STATUS_LOGGEDIN,  PROCESS_INPLACE,      &WorldSession::HandleQueryScenarioPOI);
+     DEFINE_HANDLER(CMSG_QUERY_SELECTED_WOW_LABS_AREA,                       STATUS_UNHANDLED, PROCESS_INPLACE,      &WorldSession::Handle_NULL);
+@@ -972,7 +972,7 @@ void OpcodeTable::InitializeClientOpcodes()
+     DEFINE_HANDLER(CMSG_REQUEST_LATEST_SPLASH_SCREEN,                       STATUS_LOGGEDIN,  PROCESS_INPLACE,      &WorldSession::HandleRequestLatestSplashScreen);
+     DEFINE_HANDLER(CMSG_REQUEST_LFG_LIST_BLACKLIST,                         STATUS_UNHANDLED, PROCESS_INPLACE,      &WorldSession::Handle_NULL);
+     DEFINE_HANDLER(CMSG_REQUEST_MYTHIC_PLUS_AFFIXES,                        STATUS_UNHANDLED, PROCESS_INPLACE,      &WorldSession::Handle_NULL);
+-    DEFINE_HANDLER(CMSG_REQUEST_MYTHIC_PLUS_SEASON_DATA,                    STATUS_UNHANDLED, PROCESS_INPLACE,      &WorldSession::Handle_NULL);
++    DEFINE_HANDLER(CMSG_REQUEST_MYTHIC_PLUS_SEASON_DATA,                    STATUS_LOGGEDIN,  PROCESS_INPLACE,      &WorldSession::HandleRequestMythicPlusSeasonData);
+     DEFINE_HANDLER(CMSG_REQUEST_PARTY_ELIGIBILITY_FOR_DELVE_TIERS,          STATUS_UNHANDLED, PROCESS_INPLACE,      &WorldSession::Handle_NULL);
+     DEFINE_HANDLER(CMSG_REQUEST_PARTY_JOIN_UPDATES,                         STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleRequestPartyJoinUpdates);
+     DEFINE_HANDLER(CMSG_REQUEST_PARTY_MEMBER_STATS,                         STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleRequestPartyMemberStatsOpcode);
+@@ -1023,7 +1023,7 @@ void OpcodeTable::InitializeClientOpcodes()
+     DEFINE_HANDLER(CMSG_SEND_TEXT_EMOTE,                                    STATUS_LOGGEDIN,  PROCESS_INPLACE,      &WorldSession::HandleTextEmoteOpcode);
+     DEFINE_HANDLER(CMSG_SERVER_TIME_OFFSET_REQUEST,                         STATUS_AUTHED,    PROCESS_INPLACE,      &WorldSession::HandleServerTimeOffsetRequest);
+     DEFINE_HANDLER(CMSG_SERVER_VALIDATION_SIGNATURE_REQUEST,                STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
+-    DEFINE_HANDLER(CMSG_SETUP_WARBAND_GROUPS,                               STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
++    DEFINE_HANDLER(CMSG_SETUP_WARBAND_GROUPS,                               STATUS_AUTHED,    PROCESS_THREADUNSAFE, &WorldSession::HandleSetupWarbandGroups);
+     DEFINE_HANDLER(CMSG_SET_ACTION_BAR_TOGGLES,                             STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleSetActionBarToggles);
+     DEFINE_HANDLER(CMSG_SET_ACTION_BUTTON,                                  STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleSetActionButtonOpcode);
+     DEFINE_HANDLER(CMSG_SET_ACTIVE_MOVER,                                   STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleSetActiveMoverOpcode);
+@@ -1092,7 +1092,7 @@ void OpcodeTable::InitializeClientOpcodes()
+     DEFINE_HANDLER(CMSG_SPLIT_ITEM,                                         STATUS_LOGGEDIN,  PROCESS_INPLACE,      &WorldSession::HandleSplitItemOpcode);
+     DEFINE_HANDLER(CMSG_SPLIT_ITEM_TO_GUILD_BANK,                           STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleSplitItemToGuildBank);
+     DEFINE_HANDLER(CMSG_STAND_STATE_CHANGE,                                 STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleStandStateChangeOpcode);
+-    DEFINE_HANDLER(CMSG_START_CHALLENGE_MODE,                               STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
++    DEFINE_HANDLER(CMSG_START_CHALLENGE_MODE,                               STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleStartChallengeMode);
+     DEFINE_HANDLER(CMSG_START_INSTANCE_ABANDON_VOTE,                        STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
+     DEFINE_HANDLER(CMSG_START_SPECTATOR_WAR_GAME,                           STATUS_UNHANDLED, PROCESS_INPLACE,      &WorldSession::Handle_NULL);
+     DEFINE_HANDLER(CMSG_START_WAR_GAME,                                     STATUS_UNHANDLED, PROCESS_INPLACE,      &WorldSession::Handle_NULL);
+@@ -1384,14 +1384,14 @@ void OpcodeTable::InitializeServerOpcodes()
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CAUTIONARY_CHANNEL_MESSAGE,                                   STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CAUTIONARY_CHAT_MESSAGE,                                      STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHAIN_MISSILE_BOUNCE,                                         STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHALLENGE_MODE_COMPLETE,                                      STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
++    DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHALLENGE_MODE_COMPLETE,                                      STATUS_NEVER,       CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHALLENGE_MODE_NEW_PLAYER_RECORD,                             STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHALLENGE_MODE_REQUEST_LEADERBOARD_RESULT,                    STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHALLENGE_MODE_REQUEST_LEADERS_RESULT,                        STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHALLENGE_MODE_RESET,                                         STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHALLENGE_MODE_SET_LEAVER_PENALTY_TIMER,                      STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHALLENGE_MODE_START,                                         STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHALLENGE_MODE_UPDATE_DEATH_COUNT,                            STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
++    DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHALLENGE_MODE_START,                                         STATUS_NEVER,       CONNECTION_TYPE_REALM);
++    DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHALLENGE_MODE_UPDATE_DEATH_COUNT,                            STATUS_NEVER,       CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHANGE_PLAYER_DIFFICULTY_RESULT,                              STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHANGE_REALM_TICKET_RESPONSE,                                 STATUS_NEVER,       CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHANNEL_LIST,                                                 STATUS_NEVER,       CONNECTION_TYPE_REALM);
+@@ -1963,7 +1963,7 @@ void OpcodeTable::InitializeServerOpcodes()
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_MOTD,                                                         STATUS_NEVER,       CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_MOUNT_RESULT,                                                 STATUS_NEVER,       CONNECTION_TYPE_INSTANCE);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_MOVEMENT_ENFORCEMENT_ALERT,                                   STATUS_UNHANDLED,   CONNECTION_TYPE_INSTANCE);
+-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_MOVE_ADD_IMPULSE,                                             STATUS_UNHANDLED,   CONNECTION_TYPE_INSTANCE);
++    DEFINE_SERVER_OPCODE_HANDLER(SMSG_MOVE_ADD_IMPULSE,                                             STATUS_NEVER,       CONNECTION_TYPE_INSTANCE);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_MOVE_APPLY_INERTIA,                                           STATUS_NEVER,       CONNECTION_TYPE_INSTANCE);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_MOVE_APPLY_MOVEMENT_FORCE,                                    STATUS_NEVER,       CONNECTION_TYPE_INSTANCE);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_MOVE_DISABLE_COLLISION,                                       STATUS_NEVER,       CONNECTION_TYPE_INSTANCE);
+@@ -2092,9 +2092,9 @@ void OpcodeTable::InitializeServerOpcodes()
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_MULTI_FLOOR_LEAVE_FLOOR,                                      STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_MULTI_FLOOR_NEW_FLOOR,                                        STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_MYTHIC_PLUS_ALL_MAP_STATS,                                    STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_MYTHIC_PLUS_CURRENT_AFFIXES,                                  STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
++    DEFINE_SERVER_OPCODE_HANDLER(SMSG_MYTHIC_PLUS_CURRENT_AFFIXES,                                  STATUS_NEVER,       CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_MYTHIC_PLUS_NEW_WEEK_RECORD,                                  STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_MYTHIC_PLUS_SEASON_DATA,                                      STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
++    DEFINE_SERVER_OPCODE_HANDLER(SMSG_MYTHIC_PLUS_SEASON_DATA,                                      STATUS_NEVER,       CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_NEIGHBORHOOD_ADD_SECONDARY_OWNER_RESPONSE,                    STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_NEIGHBORHOOD_BUY_HOUSE_RESPONSE,                              STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+     DEFINE_SERVER_OPCODE_HANDLER(SMSG_NEIGHBORHOOD_CANCEL_INVITATION_RESPONSE,                      STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+diff --git a/src/server/game/Server/WorldSession.cpp b/src/server/game/Server/WorldSession.cpp
+index 96455f1508..7b9e67edfe 100644
+--- a/src/server/game/Server/WorldSession.cpp
++++ b/src/server/game/Server/WorldSession.cpp
+@@ -15,6 +15,7 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "WarbandGroupMgr.h"
+ #include "WorldSession.h"
+ #include "Account.h"
+ #include "AccountMgr.h"
+@@ -148,7 +149,8 @@ WorldSession::WorldSession(uint32 id, std::string&& name, uint32 battlenetAccoun
+     _timeSyncTimer(0),
+     _calendarEventCreationCooldown(0),
+     _battlePetMgr(std::make_unique<BattlePets::BattlePetMgr>(this)),
+-    _collectionMgr(std::make_unique<CollectionMgr>(this))
++    _collectionMgr(std::make_unique<CollectionMgr>(this)),
++    _warbandGroupMgr(std::make_unique<WarbandGroupMgr>(this))
+ {
+     if (m_Socket[CONNECTION_TYPE_REALM])
+     {
+@@ -1320,6 +1322,8 @@ public:
+         TRANSMOG_ILLUSIONS,
+         TRANSMOG_OUTFITS,
+         WARBAND_SCENES,
++        WARBAND_GROUPS,
++        WARBAND_GROUP_MEMBERS,
+         PLAYER_DATA_ELEMENTS_ACCOUNT,
+         PLAYER_DATA_FLAGS_ACCOUNT,
+ 
+@@ -1377,6 +1381,14 @@ public:
+         stmt->setUInt32(0, battlenetAccountId);
+         ok = SetPreparedQuery(WARBAND_SCENES, stmt) && ok;
+ 
++        stmt = LoginDatabase.GetPreparedStatement(LOGIN_SEL_BNET_WARBAND_GROUPS);
++        stmt->setUInt32(0, battlenetAccountId);
++        ok = SetPreparedQuery(WARBAND_GROUPS, stmt) && ok;
++
++        stmt = LoginDatabase.GetPreparedStatement(LOGIN_SEL_BNET_WARBAND_GROUP_MEMBERS);
++        stmt->setUInt32(0, battlenetAccountId);
++        ok = SetPreparedQuery(WARBAND_GROUP_MEMBERS, stmt) && ok;
++
+         stmt = LoginDatabase.GetPreparedStatement(LOGIN_SEL_BNET_PLAYER_DATA_ELEMENTS_ACCOUNT);
+         stmt->setUInt32(0, battlenetAccountId);
+         ok = SetPreparedQuery(PLAYER_DATA_ELEMENTS_ACCOUNT, stmt) && ok;
+@@ -1440,6 +1452,7 @@ void WorldSession::InitializeSessionCallback(LoginDatabaseQueryHolder const& hol
+     _collectionMgr->LoadAccountTransmogIllusions(holder.GetPreparedResult(AccountInfoQueryHolder::TRANSMOG_ILLUSIONS));
+     _collectionMgr->LoadAccountTransmogOutfits(holder.GetPreparedResult(AccountInfoQueryHolder::TRANSMOG_OUTFITS));
+     _collectionMgr->LoadAccountWarbandScenes(holder.GetPreparedResult(AccountInfoQueryHolder::WARBAND_SCENES));
++    _warbandGroupMgr->LoadAccountGroups(holder.GetPreparedResult(AccountInfoQueryHolder::WARBAND_GROUPS), holder.GetPreparedResult(AccountInfoQueryHolder::WARBAND_GROUP_MEMBERS));
+     LoadPlayerDataAccount(holder.GetPreparedResult(AccountInfoQueryHolder::PLAYER_DATA_ELEMENTS_ACCOUNT), holder.GetPreparedResult(AccountInfoQueryHolder::PLAYER_DATA_FLAGS_ACCOUNT));
+ 
+     if (!m_inQueue)
+diff --git a/src/server/game/Server/WorldSession.h b/src/server/game/Server/WorldSession.h
+index 9968381592..85c8eaa44a 100644
+--- a/src/server/game/Server/WorldSession.h
++++ b/src/server/game/Server/WorldSession.h
+@@ -40,6 +40,7 @@
+ 
+ class BlackMarketEntry;
+ class CollectionMgr;
++class WarbandGroupMgr;
+ class Creature;
+ class InstanceLock;
+ class Item;
+@@ -173,6 +174,8 @@ namespace WorldPackets
+         class UpdateBankTabSettings;
+         class AutoDepositCharacterBank;
+         class BankerActivate;
++        class AccountBankDepositMoney;
++        class AccountBankWithdrawMoney;
+     }
+ 
+     namespace Battleground
+@@ -261,6 +264,7 @@ namespace WorldPackets
+         class GenerateRandomCharacterName;
+         class GetUndeleteCharacterCooldownStatus;
+         class ReorderCharacters;
++        class SetupWarbandGroups;
+         class UndeleteCharacter;
+         class PlayerLogin;
+         class LogoutRequest;
+@@ -503,6 +507,12 @@ namespace WorldPackets
+         class SendMail;
+     }
+ 
++    namespace ChallengeMode
++    {
++        class RequestMythicPlusSeasonData;
++        class StartChallengeMode;
++    }
++
+     namespace Misc
+     {
+         class SetSelection;
+@@ -673,6 +683,7 @@ namespace WorldPackets
+         class QuestGiverStatusQuery;
+         class QuestGiverStatusMultipleQuery;
+         class QuestGiverHello;
++        class QueryQuestItemUsability;
+         class QueryQuestInfo;
+         class QuestGiverChooseReward;
+         class QuestGiverCloseQuest;
+@@ -1233,6 +1244,7 @@ class TC_GAME_API WorldSession
+         BattlePets::BattlePetMgr* GetBattlePetMgr() const { return _battlePetMgr.get(); }
+ 
+         CollectionMgr* GetCollectionMgr() const { return _collectionMgr.get(); }
++        WarbandGroupMgr* GetWarbandGroupMgr() const { return _warbandGroupMgr.get(); }
+ 
+     public:                                                 // opcodes handlers
+ 
+@@ -1242,6 +1254,7 @@ class TC_GAME_API WorldSession
+ 
+         void HandleCharEnum(CharacterDatabaseQueryHolder const& holder);
+         void HandleCharEnumOpcode(WorldPackets::Character::EnumCharacters& /*enumCharacters*/);
++        void HandleSetupWarbandGroups(WorldPackets::Character::SetupWarbandGroups& setupWarbandGroups);
+         void HandleCharUndeleteEnumOpcode(WorldPackets::Character::EnumCharacters& /*enumCharacters*/);
+         void HandleCharDeleteOpcode(WorldPackets::Character::CharDelete& charDelete);
+         void HandleCharCreateOpcode(WorldPackets::Character::CreateCharacter& charCreate);
+@@ -1536,6 +1549,8 @@ class TC_GAME_API WorldSession
+         void HandleBuyBankTab(WorldPackets::Bank::BuyBankTab const& buyBankTab);
+         void HandleUpdateBankTabSettings(WorldPackets::Bank::UpdateBankTabSettings const& updateBankTabSettings);
+         void HandleAutoDepositCharacterBank(WorldPackets::Bank::AutoDepositCharacterBank const& autoDepositCharacterBank);
++        void HandleAccountBankDepositMoney(WorldPackets::Bank::AccountBankDepositMoney const& accountBankDepositMoney);
++        void HandleAccountBankWithdrawMoney(WorldPackets::Bank::AccountBankWithdrawMoney const& accountBankWithdrawMoney);
+ 
+         // Black Market
+         void HandleBlackMarketOpen(WorldPackets::BlackMarket::BlackMarketOpen& blackMarketOpen);
+@@ -1616,6 +1631,7 @@ class TC_GAME_API WorldSession
+         void HandleQuestgiverQueryQuestOpcode(WorldPackets::Quest::QuestGiverQueryQuest& packet);
+         void HandleQuestgiverChooseRewardOpcode(WorldPackets::Quest::QuestGiverChooseReward& packet);
+         void HandleQuestgiverRequestRewardOpcode(WorldPackets::Quest::QuestGiverRequestReward& packet);
++        void HandleQueryQuestItemUsability(WorldPackets::Quest::QueryQuestItemUsability& packet);
+         void HandleQuestQueryOpcode(WorldPackets::Quest::QueryQuestInfo& packet);
+         void HandleQuestLogRemoveQuest(WorldPackets::Quest::QuestLogRemoveQuest& packet);
+         void HandleQuestConfirmAccept(WorldPackets::Quest::QuestConfirmAccept& packet);
+@@ -1709,6 +1725,8 @@ class TC_GAME_API WorldSession
+         void HandleRandomRollOpcode(WorldPackets::Misc::RandomRollClient& packet);
+         void HandleFarSightOpcode(WorldPackets::Misc::FarSight& packet);
+         void HandleSetDungeonDifficultyOpcode(WorldPackets::Misc::SetDungeonDifficulty& setDungeonDifficulty);
++        void HandleStartChallengeMode(WorldPackets::ChallengeMode::StartChallengeMode& packet);
++        void HandleRequestMythicPlusSeasonData(WorldPackets::ChallengeMode::RequestMythicPlusSeasonData& packet);
+         void HandleSetRaidDifficultyOpcode(WorldPackets::Misc::SetRaidDifficulty& setRaidDifficulty);
+         void HandleSetTitleOpcode(WorldPackets::Character::SetTitle& packet);
+         void HandleTimeSync(uint32 counter, int64 clientTime, TimePoint responseReceiveTime);
+@@ -2058,6 +2076,7 @@ class TC_GAME_API WorldSession
+         std::unique_ptr<BattlePets::BattlePetMgr> _battlePetMgr;
+ 
+         std::unique_ptr<CollectionMgr> _collectionMgr;
++        std::unique_ptr<WarbandGroupMgr> _warbandGroupMgr;
+ 
+         ConnectToKey _instanceConnectKey;
+ 
+diff --git a/src/server/game/Spells/Auras/SpellAuraEffects.cpp b/src/server/game/Spells/Auras/SpellAuraEffects.cpp
+index 617d4e7677..ac84cce23b 100644
+--- a/src/server/game/Spells/Auras/SpellAuraEffects.cpp
++++ b/src/server/game/Spells/Auras/SpellAuraEffects.cpp
+@@ -47,6 +47,7 @@
+ #include "Unit.h"
+ #include "Util.h"
+ #include "Vehicle.h"
++#include "VueloDinamicoMgr.h"
+ #include "Weather.h"
+ #include "WorldPacket.h"
+ #include "WorldSession.h"
+@@ -2832,6 +2833,12 @@ void AuraEffect::HandleAuraMounted(AuraApplication const* aurApp, uint8 mode, bo
+                 target->SetFlightCapabilityID(mountCapability->FlightCapabilityID, true);
+                 target->CastSpell(target, mountCapability->ModSpellAuraID, this);
+             }
++
++            // Vuelo dinamico (skyriding): el core no decide el estilo de vuelo ni pone el aura
++            // Vigor que el cliente exige para castear las habilidades activas. Ver
++            // src/server/game/VueloDinamico/. La capacidad que trae la propia montura dice si
++            // vuela y si es de tierra (asi un caballo no sale volando).
++            Trinity::VueloDinamico::Mgr::instance()->AplicarAlMontar(target, GetAmountAsInt());
+         }
+     }
+     else
+@@ -2855,6 +2862,9 @@ void AuraEffect::HandleAuraMounted(AuraApplication const* aurApp, uint8 mode, bo
+                 target->RemoveAurasDueToSpell(mountCapability->ModSpellAuraID, target->GetGUID());
+ 
+         target->SetFlightCapabilityID(0, true);
++
++        // Vuelo dinamico: al desmontar se apagan los flags de vuelo y se saca el Vigor.
++        Trinity::VueloDinamico::Mgr::instance()->AplicarAlDesmontar(target);
+     }
+ }
+ 
+diff --git a/src/server/scripts/Custom/custom_script_loader.cpp b/src/server/scripts/Custom/custom_script_loader.cpp
+index 9e5e9ba2bf..9bcc21c475 100644
+--- a/src/server/scripts/Custom/custom_script_loader.cpp
++++ b/src/server/scripts/Custom/custom_script_loader.cpp
+@@ -17,8 +17,15 @@
+ 
+ // This is where scripts' loading functions should be declared:
+ 
++void AddSC_miticas_custom();   // miticas_custom.cpp - sistema de miticas+ propio (piedras angulares)
++void AddSC_vuelo_dinamico();   // vuelo_dinamico_custom.cpp - vuelo dinamico (skyriding) propio
++void AddSC_mentoria_warband(); // mentoria_warband_custom.cpp - tutoria de escuadra (bonus de XP de cuenta)
++
+ // The name of this function should match:
+ // void Add${NameOfDirectory}Scripts()
+ void AddCustomScripts()
+ {
++    AddSC_miticas_custom();
++    AddSC_vuelo_dinamico();
++    AddSC_mentoria_warband();
+ }
+diff --git a/src/server/scripts/DragonIsles/RubyLifePools/ruby_life_pools.h b/src/server/scripts/DragonIsles/RubyLifePools/ruby_life_pools.h
+index 20a688dba8..6123f209b6 100644
+--- a/src/server/scripts/DragonIsles/RubyLifePools/ruby_life_pools.h
++++ b/src/server/scripts/DragonIsles/RubyLifePools/ruby_life_pools.h
+@@ -38,7 +38,10 @@ enum RLPCreatureIds
+     // Bosses
+     BOSS_MELIDRUSSA_CHILLWORN   = 188252,
+     BOSS_KOKIA_BLAZEHOOF        = 189232,
+-    BOSS_KYRAKKA                = 190484
++    // OJO (medido el 17-sep-2026): el 190484 de upstream NO tiene spawn en la base (0 filas en
++    // `creature`); Kyrakka es 199790 (el spawn nuestro, migracion sv_2026_09_17_90). Con el
++    // numero de upstream, su DATA_KYRAKKA_AND_ERKHART_STORMVEIN nunca pasaba a DONE.
++    BOSS_KYRAKKA                = 199790
+ };
+ 
+ enum RLPGameObjectIds
+diff --git a/src/server/scripts/Zandalar/AtalDazar/atal_dazar.h b/src/server/scripts/Zandalar/AtalDazar/atal_dazar.h
+index afd5015ad0..d558fa13cb 100644
+--- a/src/server/scripts/Zandalar/AtalDazar/atal_dazar.h
++++ b/src/server/scripts/Zandalar/AtalDazar/atal_dazar.h
+@@ -37,10 +37,16 @@ enum AtalDazarDataTypes
+ enum AtalDazarCreatureIds
+ {
+     // Bosses
+-    BOSS_PRIESTESS_ALUNZA = 129614,
++    // OJO (medido el 17-sep-2026, no supuesto): los entries 129614 (Alun'za) y 129412 (Yazma)
++    // que trae upstream NO tienen spawn en la base (0 filas en `creature` para cualquier mapa);
++    // lo que spawnea la TDB es 122967/122968, igual que Vol'kaal y Rezan de este mismo bloque.
++    // Con los de upstream, el mapa de `instance_atal_dazar.cpp` no reconocia a la jefa: su
++    // DATA_* nunca pasaba a DONE y la puerta de su tramo no se abria sola. El numero de esta
++    // constante tiene que ser el que EXISTE, no el que nombra el cliente moderno.
++    BOSS_PRIESTESS_ALUNZA = 122967,
+     BOSS_VOLKAAL          = 122965,
+     BOSS_REZAN            = 122963,
+-    BOSS_YAZMA            = 129412
++    BOSS_YAZMA            = 122968
+ };
+ 
+ enum AtalDazarGameObjectIds
