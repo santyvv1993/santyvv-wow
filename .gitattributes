@@ -1,0 +1,5 @@
+# Los parches, el SQL y los scripts se aplican tal cual estan guardados: nunca convertir finales de linea
+*.patch -text
+*.sql -text
+*.sh -text
+*.tsv -text
